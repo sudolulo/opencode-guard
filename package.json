@@ -1,0 +1,61 @@
+{
+  "name": "opencode-guard",
+  "version": "1.0.0",
+  "description": "Permission modes and a shell safety floor for opencode: static read rules, credential guards, a classifier consulted only when nobody can be asked, loop detection and secret redaction.",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "ai-agent",
+    "coding-agent",
+    "permissions",
+    "safety",
+    "guardrails",
+    "classifier",
+    "secret-redaction",
+    "shell"
+  ],
+  "homepage": "https://github.com/sudolulo/opencode-guard#readme",
+  "bugs": {
+    "url": "https://github.com/sudolulo/opencode-guard/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sudolulo/opencode-guard.git"
+  },
+  "license": "MIT",
+  "author": "Holden Salomon <holden@ssalomon.com>",
+  "type": "module",
+  "main": "plugin.js",
+  "bin": {
+    "oc-mode": "bin/oc-mode",
+    "oc-auto": "bin/oc-auto",
+    "oc-check": "bin/oc-check",
+    "oc-reveal": "bin/oc-reveal"
+  },
+  "files": [
+    "plugin.js",
+    "lib/",
+    "bin/",
+    "examples/",
+    "NOTICE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.18.22",
+    "cc-safety-net": "^2.4.5"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.22 <2"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

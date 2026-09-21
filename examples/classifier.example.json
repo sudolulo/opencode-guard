@@ -1,0 +1,7 @@
+{
+  "url": "http://localhost:8080/v1/chat/completions",
+  "model": "qwen3-4b-instruct",
+  "private": true,
+  "votes": 1,
+  "extraBody": { "chat_template_kwargs": { "enable_thinking": false } }
+}

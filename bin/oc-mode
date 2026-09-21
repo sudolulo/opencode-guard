@@ -1,0 +1,87 @@
+#!/bin/bash
+# oc-mode -- view or switch the opencode permission mode.
+#
+# The everyday control, the shape Claude Code has. opencode-guard re-reads the
+# flag file on every permission, so a change takes effect in a running session
+# with no restart.
+#
+#   manual  ask about everything opencode would ask about       (the default)
+#   edits   file edits and reads go through; shell still asks
+#   auto    everything goes through, except a shell command the classifier will
+#           not call SAFE -- that is refused, with a reason the agent can act on
+#   god     everything runs, nothing asks, and the safety floor stands aside
+#           (cc-safety-net and the credential guard included; redaction stays on)
+#           -- PER SESSION AND ATTENDED ONLY, so not settable here: this script
+#           writes the GLOBAL default, which headless runs inherit, and a
+#           headless run must keep its floor. Set it on one session from a
+#           TUI integration instead.
+#           opencode-guard resolves a hand-written global "god" to auto, and
+#           refuses god to unattended sessions whatever any flag file says.
+#
+# The classifier is only consulted in auto mode, because the only question it
+# answers is "may this run without asking anyone?". In manual, edits and god mode
+# it never runs: no model call, no waiting on the GPU.
+#
+# `next` walks manual -> edits -> auto -> manual: each press asks for less, and
+# god is deliberately not on the global cycle.
+#
+# NB: this cannot override `opencode --auto`, which auto-approves inside opencode
+# before any plugin sees the permission. Launch opencode WITHOUT --auto and use
+# `oc-mode auto` instead; that is the same thing with a floor under it and a way back.
+#
+# Usage: oc-mode [manual|edits|auto|next]   (no arg: print current)
+set -u
+FLAG="$HOME/.config/opencode/mode"
+mkdir -p "${FLAG%/*}" 2>/dev/null || true
+
+cur() {
+    local v
+    v="$(cat "$FLAG" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    case "$v" in
+        # A global "god" resolves to auto -- same rule as opencode-guard.
+        god) echo auto ;;
+        manual|edits|auto) echo "$v" ;;
+        *) echo manual ;;
+    esac
+}
+
+describe() {
+    case "$1" in
+        manual) echo "asks about everything" ;;
+        edits)  echo "edits go through, shell asks" ;;
+        auto)   echo "everything goes through; risky shell commands are refused" ;;
+        god)    echo "everything runs, nothing asks, safety floor off" ;;
+    esac
+}
+
+# Changing it is for a person, not for an agent lifting its own floor: refuse to
+# write when running inside opencode (which sets OPENCODE=1 for everything it
+# spawns). Showing the current value is always fine.
+if [ -n "${OPENCODE:-}" ] && [ "${1:-show}" != "show" ]; then
+    echo "oc-mode: refusing to change the mode from inside opencode (OPENCODE=${OPENCODE})." >&2
+    echo "  Ask the user to run it in their own terminal." >&2
+    exit 77
+fi
+
+case "${1:-show}" in
+    manual|edits|auto) echo "$1" > "$FLAG" ;;
+    god)
+        echo "oc-mode: god is per-session and attended only -- set it on one session" >&2
+        echo "from inside opencode. This script sets the GLOBAL default, which headless" >&2
+        echo "runs inherit, and a headless run must keep its safety floor." >&2
+        exit 64 ;;
+    next)
+        case "$(cur)" in
+            manual) echo edits  > "$FLAG" ;;
+            edits)  echo auto   > "$FLAG" ;;
+            *)      echo manual > "$FLAG" ;;
+        esac ;;
+    show) ;;
+    *) echo "usage: oc-mode [manual|edits|auto|next]" >&2; exit 64 ;;
+esac
+
+MODE="$(cur)"
+echo "opencode mode: $MODE -- $(describe "$MODE")"
+if [ -n "${TMUX:-}" ] || tmux has-session 2>/dev/null; then
+    tmux display-message "opencode: $MODE -- $(describe "$MODE")" 2>/dev/null
+fi

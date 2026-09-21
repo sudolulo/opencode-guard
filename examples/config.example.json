@@ -1,0 +1,10 @@
+{
+  "extraCredentialPatterns": [
+    { "pattern": "\\.config/my-secrets/", "root": ".config/my-secrets" },
+    { "pattern": "\\.env\\b(?!\\.(?:example|sample|template))", "root": ".env" }
+  ],
+  "extraPromptableCredentialPatterns": ["\\bvault\\s+kv\\s+get\\b"],
+  "credentialAdvice": "Secrets are passed to processes by the deploy wrapper -- reference them from config, never read them into a session.",
+  "trustedSshHosts": ["gpu-box", "nas", "*.lan"],
+  "loopGuard": { "enabled": true, "warnAt": 12, "handBackAt": 25 }
+}

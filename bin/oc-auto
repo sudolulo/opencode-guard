@@ -1,0 +1,73 @@
+#!/bin/bash
+# oc-auto -- view or switch the opencode-guard level.
+#
+# The plugin re-reads the flag file on every bash call, so a change takes effect
+# in a running session with no restart.
+#
+# This is the ESCAPE HATCH. The everyday control is `oc-mode`, which picks
+# manual / edits / auto; this one decides how much of the safety floor runs.
+#
+#   on      credential guard + cc-safety-net + the classifier   (default)
+#   static  credential guard + cc-safety-net only; no model call, so nothing waits
+#           on a model and no model gets a say. In auto mode this means only
+#           statically-recognised reads are waved through; everything else asks.
+#   off     nothing from this plugin. opencode's own globs are all that is left.
+#
+# `next` walks on -> static -> off -> on: each press loosens, then wraps. That is
+# what you want bound to a key, because you press it when something was blocked.
+#
+# Usage: oc-auto [on|static|off|next]   (no arg: print current)
+set -u
+FLAG="$HOME/.config/opencode/autoclass"
+mkdir -p "${FLAG%/*}" 2>/dev/null || true
+
+cur() {
+    local v
+    # `cat ... 2>/dev/null`, not `< "$FLAG" 2>/dev/null`: redirections are set up
+    # left to right, so a missing file is reported by the shell before stderr has
+    # been redirected, and a key binding would flash an error for an unset flag.
+    v="$(cat "$FLAG" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    case "$v" in
+        on|static|off) echo "$v" ;;
+        strict) echo static ;;      # what the no-model level used to be called
+        full|auto) echo on ;;       # both used to mean "everything on"
+        *) echo on ;;               # unset or unreadable means the default
+    esac
+}
+
+describe() {
+    case "$1" in
+        on)     echo "credential + safety-net checks and the classifier" ;;
+        static) echo "credential + safety-net checks only, no model call" ;;
+        off)    echo "no plugin checks; only opencode's own globs" ;;
+    esac
+}
+
+# Changing it is for a person, not for an agent lifting its own floor: refuse to
+# write when running inside opencode (which sets OPENCODE=1 for everything it
+# spawns). Showing the current value is always fine.
+if [ -n "${OPENCODE:-}" ] && [ "${1:-show}" != "show" ]; then
+    echo "oc-auto: refusing to change the level from inside opencode (OPENCODE=${OPENCODE})." >&2
+    echo "  Ask the user to run it in their own terminal." >&2
+    exit 77
+fi
+
+case "${1:-show}" in
+    on|static|off) echo "$1" > "$FLAG" ;;
+    strict) echo static > "$FLAG" ;;
+    full|auto) echo on > "$FLAG" ;;
+    next)
+        case "$(cur)" in
+            on)     echo static > "$FLAG" ;;
+            static) echo off    > "$FLAG" ;;
+            *)      echo on     > "$FLAG" ;;
+        esac ;;
+    show) ;;
+    *) echo "usage: oc-auto [on|static|off|next]" >&2; exit 64 ;;
+esac
+
+LEVEL="$(cur)"
+echo "autoclass floor: $LEVEL -- $(describe "$LEVEL")"
+if [ -n "${TMUX:-}" ] || tmux has-session 2>/dev/null; then
+    tmux display-message "opencode autoclass floor: $LEVEL -- $(describe "$LEVEL")" 2>/dev/null
+fi

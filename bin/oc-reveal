@@ -1,0 +1,57 @@
+#!/bin/bash
+# oc-reveal -- briefly stop opencode-guard redacting secrets out of tool output.
+#
+# Redaction has to have a way out, or it becomes the thing people switch off for
+# good. This is that way out: time-boxed, and armed by a person at a terminal.
+#
+#   oc-reveal            how long is left
+#   oc-reveal <seconds>  open the window (default 60, max 600)
+#   oc-reveal off        close it now
+#
+# While the window is open nothing is redacted, and any output that WOULD have been
+# redacted gains a line saying so -- a transcript holding a secret should not look
+# like one that does not.
+#
+# ☠️ Run this in your own shell, NOT through an agent. Two things stop that: the
+# plugin refuses any bash command naming `oc-reveal` or the flag file, and this
+# script refuses to run when $OPENCODE is set. Neither is proof against a determined
+# process on the same box; both stop a helpful model unblocking itself.
+set -u
+FLAG="$HOME/.config/opencode/reveal"
+mkdir -p "${FLAG%/*}" 2>/dev/null || true
+MAX=600
+DEFAULT=60
+
+if [ -n "${OPENCODE:-}" ]; then
+    echo "oc-reveal: refusing -- this is running inside opencode (OPENCODE=${OPENCODE})." >&2
+    echo "  Ask the user to run it in their own terminal." >&2
+    exit 77
+fi
+
+remaining() {
+    local deadline now
+    deadline="$(cat "$FLAG" 2>/dev/null | tr -dc '0-9')"
+    [ -n "$deadline" ] || { echo 0; return; }
+    now="$(date +%s000)"
+    if [ "$deadline" -gt "$now" ]; then echo $(( (deadline - now) / 1000 )); else echo 0; fi
+}
+
+case "${1:-show}" in
+    show)
+        left="$(remaining)"
+        if [ "$left" -gt 0 ]; then echo "reveal window OPEN -- ${left}s left; output is NOT being redacted"
+        else echo "reveal window closed -- secrets are redacted from tool output"; fi
+        exit 0 ;;
+    off|0|close)
+        rm -f "$FLAG"; echo "reveal window closed"; exit 0 ;;
+    ''|*[!0-9]*)
+        echo "usage: oc-reveal [<seconds>|off]   (no arg: show remaining)" >&2; exit 64 ;;
+esac
+
+secs="$1"
+[ "$secs" -gt "$MAX" ] && secs="$MAX" && echo "capped at ${MAX}s" >&2
+[ "$secs" -eq 0 ] && secs="$DEFAULT"
+echo $(( $(date +%s000) + secs * 1000 )) > "$FLAG"
+chmod 600 "$FLAG" 2>/dev/null || true
+echo "reveal window OPEN for ${secs}s -- tool output will NOT be redacted."
+echo "  close early with: oc-reveal off"

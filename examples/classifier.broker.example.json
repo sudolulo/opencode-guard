@@ -1,0 +1,7 @@
+{
+  "brokerAgents": {
+    "cloud-classifier": "guard-classifier",
+    "local-classifier": "guard-classifier-local"
+  },
+  "noThinkProviders": ["llamacpp"]
+}

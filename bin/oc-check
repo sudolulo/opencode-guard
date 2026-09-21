@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+// oc-check -- dry-run the opencode-guard decision for one command, without running it.
+//
+// Built because an agent debugging under auto mode reported the classifier as
+// "nondeterministic": it could not tell an expired manual approval from a changed
+// verdict, and the denial message forbids probing by rephrasing. This answers the
+// question up front, for free: it walks the SAME tiers in the SAME order as the
+// plugin (reveal-arm guard, credential guard, cc-safety-net, static read table,
+// classifier) and reports what each mode would do with the result.
+//
+//   oc-check '<command>'            full check, asking the classifier.json endpoint
+//   oc-check --static '<command>'   static tiers only, no model call, instant
+//
+// Advisory, not binding: the plugin decides live at execution time. The one gap is
+// deliberate -- this never caches, while the plugin caches verdicts for six hours,
+// so a borderline command can differ between two oc-check runs the same way it can
+// between cache entries (the seed is pinned, but continuous batching on the server
+// is the limit).
+import { readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, dirname } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const here = dirname(realpathSync(process.argv[1]));
+const P = await import(pathToFileURL(join(here, "../lib/policy.js")).href);
+
+const argv = process.argv.slice(2);
+const wantLlm = !argv.includes("--static");
+const command = P.strip(argv.filter((a) => a !== "--static").join(" ").trim());
+if (!command) {
+  console.error("usage: oc-check [--static] '<command>'");
+  process.exit(64);
+}
+
+const read = (p, fallback) => {
+  try { return readFileSync(p, "utf8").trim() || fallback; } catch { return fallback; }
+};
+const level = P.normalizeLevel(read(join(homedir(), ".config/opencode/autoclass"), "on"));
+
+console.log(`command: ${command}`);
+console.log(`level:   ${level}${level === "on" ? "" : "  (level changes what runs live -- this report assumes the full floor)"}`);
+
+// ---- The floor, in the plugin's order. First hit wins, like the throws do.
+let floor = null;
+if (/\boc-reveal\b/.test(command) || /\.config\/opencode\/reveal\b/.test(command)) {
+  floor = "reveal-arm guard (the reveal window is armed by a person at a terminal)";
+} else if (P.commandWritesControlFile(command)) {
+  floor = "control-file guard (the mode, level and classifier files are set by a person)";
+} else if (P.touchesHardCredentials(command)) {
+  floor = "hard credential guard (file path to a credential store -- always blocks)";
+} else if (P.touchesPromptableCredentials(command)) {
+  // Promptable: in unattended sessions the plugin throws; in attended auto mode
+  // it returns and lets the permission system prompt the user.
+  console.log("floor:   promptable credential guard (password-manager CLI) -- in attended auto mode this reaches the user as a prompt; in unattended sessions it blocks");
+  console.log("verdict: depends on attendance. In auto mode with a person present, the prompt is shown. In opencode run/serve/--auto, the plugin throws.");
+  process.exit(0);
+} else if (P.touchesCredentials(command)) {
+  floor = "credential guard (names a credential store)";
+} else {
+  const { loadSafetyNet, safetyNetVerdict } = await import(pathToFileURL(join(here, "../lib/safety-net.js")).href);
+  const { checkCommand } = await loadSafetyNet();
+  const v = safetyNetVerdict(checkCommand, { command, cwd: process.cwd() });
+  if (v.kind === "deny") floor = `cc-safety-net (rule ${v.ruleId ?? "?"}: ${v.reason})`;
+  if (v.kind === "unavailable") {
+    console.log("floor:   cc-safety-net unavailable -- skipped (the plugin logs the same and falls through)");
+  }
+}
+
+if (floor) {
+  console.log(`floor:   BLOCKED by the ${floor}`);
+  console.log("verdict: denied in manual, edits and auto, attended or not. Only god mode (per-session, attended) stands the floor down.");
+  process.exit(1);
+}
+console.log("floor:   passes");
+
+// ---- Static read table: settles without a model call.
+if (P.commandIsRead(command)) {
+  console.log("static:  read-only -- allow(read), no model call");
+  console.log("verdict: runs without asking in auto, god and unattended sessions; manual and edits still raise opencode's own prompt");
+  process.exit(0);
+}
+console.log("static:  not settled by the read table");
+
+// ---- The classifier. Only the direct lane is reachable from here: the broker lane
+// runs inside an opencode session, which a CLI does not have. Without a configured
+// endpoint this reports static policy only.
+let llm = null;
+if (wantLlm) {
+  const { classifierConfig, classifyDirect } = await import(pathToFileURL(join(here, "../lib/classifier.js")).href);
+  const config = classifierConfig();
+  if (!config.configured) {
+    console.log("llm:     skipped (no classifier url in ~/.config/opencode/classifier.json; the broker lane needs an opencode session)");
+  } else {
+    llm = await classifyDirect({ command, cwd: process.cwd(), config });
+    console.log(`llm:     ${llm}`);
+  }
+} else {
+  console.log("llm:     skipped (--static)");
+}
+
+const attended = llm === "SAFE"
+  ? "auto runs it without asking; manual and edits prompt"
+  : llm === "RISKY"
+    ? "auto DENIES it (switch to manual mode and answer the prompt instead); manual and edits prompt"
+    : "auto denies anything unjudged; manual and edits prompt";
+console.log(`verdict: ${attended}; god runs it; unattended (opencode run/serve/--auto) ${llm === "SAFE" ? "runs it" : "denies it"}`);
+process.exit(llm === "SAFE" ? 0 : 1);

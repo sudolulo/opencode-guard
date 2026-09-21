@@ -5,6 +5,16 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.1.0] — 2026-09-21
+
+### Added
+
+- **`authTokenFile` in classifier.json.** Names a file whose first line is the
+  direct endpoint's bearer token, read on each classification, so the token can
+  live in a secrets file instead of in classifier.json itself. `~/` is expanded.
+  `authToken` still wins when both are set, and `$OPENCODE_GUARD_CLASSIFIER_TOKEN`
+  remains the last resort. An unreadable file means no token, never an error.
+
 ## [1.0.1] — 2026-09-21
 
 ### Fixed

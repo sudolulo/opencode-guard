@@ -126,6 +126,7 @@ command to run.
 | `url` | Endpoint. Also `$OPENCODE_GUARD_CLASSIFIER_URL`. |
 | `model` | Model id sent in the request. |
 | `authToken` | Bearer token. Also `$OPENCODE_GUARD_CLASSIFIER_TOKEN`. No header is sent without one. |
+| `authTokenFile` | A file whose first line is the bearer token, read on each classification, so the token itself stays out of this file. `~/` is expanded. `authToken` wins when both are set. |
 | `private` | `true` if the endpoint keeps data on machines you control. Only then may a session under a privacy profile use it. |
 | `votes` | 1 to 5. Above 1, the classifier is asked that many times and SAFE needs a strict majority. |
 | `timeoutMs` | Default 25000. |

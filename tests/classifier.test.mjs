@@ -51,6 +51,21 @@ test("the environment supplies a url and token when the file does not", () => {
     "http://file/", "the file wins over the environment");
 });
 
+test("authTokenFile supplies the token from its first line; authToken wins; a missing file gives none", () => {
+  const files = { [join(home, "key")]: "s3cret\nignored\n", "/abs/key": "abs\n" };
+  const configWith = (json, env = {}) => C.classifierConfig({ env, read: (path) => {
+    if (path === C.classifierConfigPath()) return JSON.stringify(json);
+    if (path in files) return files[path];
+    throw new Error("ENOENT");
+  } });
+  assert.equal(configWith({ url: "http://x/", authTokenFile: "~/key" }).authToken, "s3cret", "~/ expands to HOME");
+  assert.equal(configWith({ url: "http://x/", authTokenFile: "/abs/key" }).authToken, "abs");
+  assert.equal(configWith({ url: "http://x/", authToken: "inline", authTokenFile: "/abs/key" }).authToken, "inline");
+  assert.equal(configWith({ url: "http://x/", authTokenFile: "/missing" }).authToken, null, "no token, no throw");
+  assert.equal(configWith({ url: "http://x/", authTokenFile: "/missing" }, { OPENCODE_GUARD_CLASSIFIER_TOKEN: "env" }).authToken,
+    "env", "the environment is the last resort");
+});
+
 test("votes and timeout are clamped, and broker:false turns the broker lane off", () => {
   assert.equal(configFrom({ votes: 9 }).votes, 5);
   assert.equal(configFrom({ votes: 0 }).votes, 1);

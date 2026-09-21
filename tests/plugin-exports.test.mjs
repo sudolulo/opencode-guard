@@ -18,24 +18,23 @@ test("classifier cleanup reaches idle before deleting the disposable session", (
   const end = source.indexOf('brokerRequest("/forget"', start);
   const cleanup = source.slice(start, end);
   const abort = cleanup.indexOf("client.session.abort");
-  const wait = cleanup.indexOf("v2Client().v2.session.wait");
+  const poll = cleanup.indexOf("client.session.status");
+  const idle = cleanup.indexOf("sessionIdle(");
   const remove = cleanup.indexOf("client.session.delete");
-  assert.ok(abort >= 0 && wait > abort && remove > wait,
-    "classifier cleanup must abort, wait for idle, then delete");
+  assert.ok(abort >= 0 && poll > abort && idle > poll && remove > idle,
+    "classifier cleanup must abort, poll /session/status until idle, then delete");
 });
 
-// ☠️ This test previously asserted `v2Client().session.wait`, which pinned the
-// BUG in place: `wait` is declared only on the V2 session group (Session3), so
-// the legacy `.session` group threw "is not a function" on every cleanup, the
-// delete never ran, and 99 disposable classifier sessions leaked while this
-// suite stayed green. Assert the legacy spelling is absent, not just that some
-// wait call exists.
-test("the idle barrier uses the V2 session group, not the legacy one", () => {
+// ☠️ Two generations of this test pinned a broken barrier. The first asserted
+// `v2Client().session.wait`, which does not exist on the legacy group ("is not a
+// function", 99 leaks). The second asserted `v2Client().v2.session.wait`, which exists
+// but is an unimplemented stub on OpenCode 1.18 ("Session wait is not available yet",
+// every delete deferred, every broker-lane classification leaked its session).
+// Neither may come back.
+test("the idle barrier is a status poll, never session.wait", () => {
   const source = readFileSync(new URL("../plugin.js", import.meta.url), "utf8");
-  const legacy = /v2Client\(\)\s*\.\s*session\s*\.\s*wait/.test(source);
-  assert.equal(legacy, false, "wait() does not exist on the legacy session group");
-  assert.ok(/v2Client\(\)\s*\.\s*v2\s*\.\s*session\s*\.\s*wait/.test(source),
-    "the idle barrier must call v2Client().v2.session.wait");
+  assert.equal(/\.\s*session\s*\.\s*wait\s*\(/.test(source.replace(/^\s*\/\/.*$/gm, "")), false,
+    "session.wait is a stub on OpenCode 1.18 and never clears");
 });
 
 // ☠️ modeFor calls infoFor, which closes over the factory's client. Declared at

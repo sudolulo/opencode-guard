@@ -74,7 +74,7 @@ import {
   commandUnder, credentialAdvice, siteConfig,
   strip, commandIsRead, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
-  agentCapability, dispatchRefusal, staleToolRefusal,
+  agentCapability, dispatchRefusal, staleToolRefusal, sessionIdle,
   nativeToolWritesControlFile, commandWritesControlFile,
 } from "./lib/policy.js";
 import { brokerAvailable, brokerRequest, leaseRespectsLocalOnly, resolveProfileFor } from "./lib/broker.js";
@@ -130,6 +130,9 @@ const LOG = join(homedir(), ".local/share/opencode/autoclass.log");
 // property of how it is driven: one measured lane answered 6/6 correctly but blew
 // this budget on 2 of 6 at its default reasoning effort, and on none at `none`.
 const CLASSIFIER_TIMEOUT_MS = 12_000;
+// How long a broker-lane classifier's disposable session may take to go idle after
+// its abort before cleanup gives up and leaves it (logged as classifier-cleanup-deferred).
+const CLEANUP_IDLE_MS = 10_000;
 
 const level = () => {
   try { return normalizeLevel(readFileSync(FLAG, "utf8")); } catch { return "on"; }
@@ -487,21 +490,27 @@ const modeFor = async (sessionID) => {
         // The classifier timeout aborts the HTTP client, not necessarily the server-side
         // agent loop. Deleting immediately raced that loop's final step-start write and
         // turned a routine timeout into a SQLite foreign-key error. Stop the disposable
-        // loop, then use OpenCode's own idle barrier before removing its message history.
+        // loop, then wait until opencode reports it idle before removing its message history.
         try {
           await client.session.abort({ path: { id: sessionID }, query: { directory } });
         } catch (error) {
           log("classifier-cleanup-abort-failed", `${sessionID} ${error?.message ?? error}`);
         }
         try {
-          // ☠️ `wait` lives ONLY on the V2 session group. On this client
-          // `.session` is the legacy group (Session2: create/get/delete/
-          // children/messages/prompt/abort) and `.v2.session` is Session3,
-          // which is the only one declaring `wait`. Calling `.session.wait`
-          // threw "is not a function" on EVERY cleanup, so the delete below
-          // never ran and every disposable classifier session leaked --
-          // 99 such deferrals were recorded in the decision log before the fix.
-          await v2Client().v2.session.wait({ sessionID });
+          // ☠️ THE IDLE BARRIER IS A STATUS POLL, not `v2.session.wait`. That call exists
+          // only on the V2 group (calling `.session.wait` threw "is not a function", 99
+          // leaks), and on OpenCode 1.18 it is an unimplemented stub that rejects with
+          // "Session wait is not available yet" -- so every delete deferred and every
+          // broker-lane classification leaked its session. `/session/status` is the same
+          // supported endpoint the D0 check reads.
+          const deadline = Date.now() + CLEANUP_IDLE_MS;
+          let idle = false;
+          while (!idle && Date.now() < deadline) {
+            const got = await client.session.status({ query: { directory } });
+            idle = sessionIdle(got?.error ? null : got?.data, sessionID);
+            if (!idle) await new Promise((r) => setTimeout(r, 250));
+          }
+          if (!idle) throw new Error(`still busy after ${CLEANUP_IDLE_MS}ms`);
           await client.session.delete({ path: { id: sessionID }, query: { directory } });
         } catch (error) {
           // A leaked disposable session is safer than deleting beneath a loop that has

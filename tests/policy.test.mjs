@@ -686,3 +686,17 @@ test("a tool call for a session that is no longer running is refused", () => {
   for (const unreadable of [null, undefined, "busy", [], 42]) assert.equal(refuse(unreadable), null);
   assert.equal(P.staleToolRefusal({ statuses: {}, sessionID: undefined, tool: "bash" }), null, "no session id, nothing to judge");
 });
+
+// The broker-lane classifier cleanup's idle barrier (v2.session.wait is a stub on
+// OpenCode 1.18). Same map as D0, opposite default: this one gates a delete, so a
+// map it cannot read is never idle.
+test("a session missing from the status map is idle; busy is not; an unreadable map is never idle", () => {
+  assert.equal(P.sessionIdle({}, "ses_a"), true);
+  assert.equal(P.sessionIdle({ ses_a: { type: "idle" } }, "ses_a"), true);
+  assert.equal(P.sessionIdle({ ses_b: { type: "busy" } }, "ses_a"), true, "another session being busy does not count");
+  assert.equal(P.sessionIdle({ ses_a: { type: "busy" } }, "ses_a"), false);
+  assert.equal(P.sessionIdle({ ses_a: { type: "retry" } }, "ses_a"), false);
+  assert.equal(P.sessionIdle(null, "ses_a"), false, "cannot read the map: do not delete");
+  assert.equal(P.sessionIdle([], "ses_a"), false);
+  assert.equal(P.sessionIdle({}, undefined), false, "no session id, nothing to delete");
+});

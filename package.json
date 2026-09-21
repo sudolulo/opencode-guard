@@ -1,6 +1,6 @@
 {
   "name": "opencode-guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Permission modes and a shell safety floor for opencode: static read rules, credential guards, a classifier consulted only when nobody can be asked, loop detection and secret redaction.",
   "keywords": [
     "opencode",

@@ -5,6 +5,25 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.0.1] — 2026-09-21
+
+### Fixed
+
+- **The broker lane no longer leaks a session per classification.** Its cleanup
+  waited on `v2.session.wait` before deleting the disposable classifier session.
+  That call exists, but on OpenCode 1.18 it is an unimplemented stub that rejects
+  with `Session wait is not available yet`, so every delete deferred and every
+  broker-lane classification left its child session behind. 0.4.7 took the
+  common path off the broker lane by trying a direct endpoint first, but the
+  broker lane still runs whenever it is the only lane or the direct one fails
+  fast, and each of those runs leaked. The barrier is now a bounded poll of
+  `/session/status`, the endpoint the stale-turn check (D0) already reads, for up
+  to 10 s after the abort; the delete follows once the session is idle. A session
+  still busy at the deadline, or a status map that cannot be read, is left and
+  logged as `classifier-cleanup-deferred`, as before. It is never deleted blind.
+  `sessionIdle` in `lib/policy.js` makes the idle reading, and the two
+  source-order tests that pinned the stub call now forbid it.
+
 ## [1.0.0] — 2026-09-21
 
 First public release, under a new name: `opencode-guardrails` is taken on npm, so

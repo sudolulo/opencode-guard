@@ -100,7 +100,8 @@ test("the broker bridge does not expose guard-side lease selection", () => {
 });
 
 test("duplicate real-session failure and forget reports do not extend the circuit or retain the lease", async () => {
-  const brokerRepo = fileURLToPath(new URL("../../opencode-broker/", import.meta.url));
+  const brokerRepo = process.env.OPENCODE_BROKER_REPO ||
+    fileURLToPath(new URL("../../opencode-broker/", import.meta.url));
   const brokerScript = join(brokerRepo, "bin/opencode-broker");
   const configPath = join(brokerRepo, "tests/fixtures/config.json");
   const brokerHome = mkdtempSync(join(tmpdir(), "guard-real-broker-"));

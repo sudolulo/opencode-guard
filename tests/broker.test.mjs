@@ -12,10 +12,13 @@
 // restrictive.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import http from "node:http";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const home = mkdtempSync(join(tmpdir(), "guard-broker-"));
 process.env.HOME = home;
@@ -97,48 +100,135 @@ test("the broker bridge does not expose guard-side lease selection", () => {
 });
 
 test("duplicate real-session failure and forget reports do not extend the circuit or retain the lease", async () => {
-  const fixtureDir = join(home, "duplicate-report-broker");
-  mkdirSync(fixtureDir, { recursive: true });
-  const socketPath = B.brokerSocket(fixtureDir);
-  const leases = { ses_classifier: { targetID: "local-classifier" } };
-  const circuits = {};
-  const calls = [];
-  let clock = 1_000;
-  const server = http.createServer((request, response) => {
-    let text = "";
-    request.setEncoding("utf8");
-    request.on("data", (chunk) => { text += chunk; });
-    request.on("end", () => {
-      const body = text ? JSON.parse(text) : {};
-      calls.push({ path: request.url, body });
-      if (request.url === "/failure") {
-        const targetID = body.targetID ?? leases[body.sessionID]?.targetID;
-        if (targetID) {
-          circuits[targetID] ??= { until: clock + 5_000 };
-          delete leases[body.sessionID];
-        }
-      }
-      if (request.url === "/forget") delete leases[body.sessionID];
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end("{}");
-    });
-  });
-  await new Promise((resolve) => server.listen(socketPath, resolve));
-  try {
-    const report = { sessionID: "ses_classifier", error: "provider exploded" };
-    await B.brokerRequest("/failure", report, { dir: fixtureDir });
-    const firstUntil = circuits["local-classifier"].until;
-    clock += 1_000;
-    await B.brokerRequest("/failure", report, { dir: fixtureDir });
-    await B.brokerRequest("/forget", { sessionID: "ses_classifier" }, { dir: fixtureDir });
-    await B.brokerRequest("/forget", { sessionID: "ses_classifier" }, { dir: fixtureDir });
+  const brokerRepo = fileURLToPath(new URL("../../opencode-broker/", import.meta.url));
+  const brokerScript = join(brokerRepo, "bin/opencode-broker");
+  const configPath = join(brokerRepo, "tests/fixtures/config.json");
+  const brokerHome = mkdtempSync(join(tmpdir(), "guard-real-broker-"));
+  const brokerDir = join(brokerHome, ".local/share/opencode/model-routing");
+  const authDir = join(brokerHome, ".local/share/opencode");
+  const guardConfigDir = join(home, ".config/opencode");
+  const modeDir = join(home, ".local/share/opencode/modes");
+  mkdirSync(authDir, { recursive: true });
+  mkdirSync(join(brokerDir, "profiles"), { recursive: true });
+  mkdirSync(guardConfigDir, { recursive: true });
+  mkdirSync(modeDir, { recursive: true });
+  const authPath = join(authDir, "auth.json");
+  const authContents = Buffer.from(JSON.stringify({ anthropic: { type: "oauth" } }));
+  writeFileSync(authPath, authContents);
+  writeFileSync(join(brokerDir, "resolvable-models.json"), JSON.stringify({
+    updatedAt: Date.now(),
+    models: ["anthropic/claude-haiku-4-5"],
+  }));
+  writeFileSync(join(brokerDir, "profiles/ses_parent.json"), JSON.stringify({ profile: "auto", explicit: true }));
+  writeFileSync(join(guardConfigDir, "classifier.json"), JSON.stringify({ brokerDir }));
+  writeFileSync(join(modeDir, "ses_parent"), "auto\n");
 
-    assert.equal(leases.ses_classifier, undefined, "the real-session lease is gone");
-    assert.equal(circuits["local-classifier"].until, firstUntil, "a duplicate failure cannot extend the circuit");
-    assert.deepEqual(calls.map((call) => call.path), ["/failure", "/failure", "/forget", "/forget"]);
-    assert.equal(calls.some((call) => "targetID" in call.body), false, "the guard reports by real session only");
+  const modelsServer = http.createServer((request, response) => {
+    assert.equal(request.url, "/v1/models");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ data: [{ id: "qwen3.5-4b" }] }));
+  });
+  await new Promise((resolve) => modelsServer.listen(0, "127.0.0.1", resolve));
+  const modelsAddress = modelsServer.address();
+  const broker = spawn(process.execPath, [brokerScript, "serve"], {
+    cwd: brokerRepo,
+    env: {
+      ...process.env,
+      HOME: brokerHome,
+      OPENCODE_BROKER_CONFIG: configPath,
+      OPENCODE_BROKER_LOCAL_MODELS_URL: `http://127.0.0.1:${modelsAddress.port}/v1/models`,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let brokerStderr = "";
+  broker.stderr.on("data", (chunk) => { brokerStderr += String(chunk); });
+  await new Promise((resolve, reject) => {
+    const onData = (chunk) => {
+      if (!String(chunk).includes("listening on ")) return;
+      broker.off("exit", onExit);
+      resolve();
+    };
+    const onExit = (code, signal) => reject(new Error(
+      `fixture broker exited before listen (${code ?? signal}): ${brokerStderr}`));
+    broker.stdout.on("data", onData);
+    broker.once("exit", onExit);
+  });
+  try {
+    const authStat = statSync(authPath);
+    const authRevision = `${Math.trunc(authStat.mtimeMs)}:${authStat.size}:${createHash("sha256").update(authContents).digest("hex")}`;
+    const configFingerprint = createHash("sha256").update(readFileSync(configPath)).digest("hex");
+    const published = await B.brokerRequest("/inventory", {
+      connected: ["anthropic"],
+      providers: { anthropic: { authType: "oauth", connected: true, classification: "subscription", models: 1 } },
+      configFingerprint,
+      authRevision,
+    }, { dir: brokerDir });
+    assert.equal(published.accepted, true);
+
+    const created = [];
+    let firstFailure = null;
+    let firstTargetID = null;
+    const embeddedFetch = async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const bodyText = await request.text();
+      const body = bodyText ? JSON.parse(bodyText) : {};
+      const sessionID = `ses_classifier_${created.length + 1}`;
+      created.push({ body, sessionID });
+      return new Response(JSON.stringify({ data: { id: sessionID } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const client = {
+      session: {
+        _client: { getConfig: () => ({ baseUrl: "http://opencode.invalid", fetch: embeddedFetch, headers: new Headers() }) },
+        prompt: async (request) => {
+          const sessionID = request.path.id;
+          const lease = await B.brokerRequest("/lease", {
+            sessionID,
+            profile: "auto",
+            tier: "classifier",
+            contextTokens: 100,
+            replace: true,
+          }, { dir: brokerDir });
+          if (!firstFailure) {
+            firstTargetID = lease.target.id;
+            firstFailure = await B.brokerRequest("/failure", {
+              sessionID,
+              targetID: firstTargetID,
+              error: { statusCode: 503, message: "provider exploded" },
+            }, { dir: brokerDir });
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            return { error: { message: "provider exploded" }, response: { status: 503 } };
+          }
+          return { data: { parts: [{ type: "text", text: "SAFE" }] } };
+        },
+        abort: async () => {},
+        status: async () => ({ data: {} }),
+        delete: async (request) => {
+          await B.brokerRequest("/forget", { sessionID: request.path.id }, { dir: brokerDir });
+        },
+      },
+      postSessionIdPermissionsPermissionId: async () => ({}),
+    };
+    const { OpencodeGuard } = await import("../plugin.js");
+    const hooks = await OpencodeGuard({ client, directory: "/work" });
+    await hooks.event({ event: { type: "permission.asked", properties: {
+      id: "per_classifier", sessionID: "ses_parent", permission: "bash",
+      metadata: { command: "npm run build" },
+    } } });
+
+    const status = await B.brokerRequest("/status", {}, { dir: brokerDir });
+    assert.equal(status.leases[created[0].sessionID], undefined, "the real-session lease is gone");
+    assert.equal(Date.parse(status.circuits[firstTargetID].renewsAt), firstFailure.circuitUntil,
+      "the guard's duplicate failure report cannot extend the router's circuit");
   } finally {
-    await new Promise((resolve) => server.close(resolve));
+    if (broker.exitCode === null && broker.signalCode === null) {
+      broker.kill("SIGTERM");
+      await new Promise((resolve) => broker.once("exit", resolve));
+    }
+    await new Promise((resolve) => modelsServer.close(resolve));
+    rmSync(brokerHome, { recursive: true, force: true });
   }
 });
 

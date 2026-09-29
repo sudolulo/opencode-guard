@@ -91,12 +91,9 @@ test("the broker counts as available only when its socket exists and it is not d
   }
 });
 
-test("a local-only lease must name a local target", () => {
-  assert.equal(B.leaseRespectsLocalOnly({ id: "gpu", kind: "local" }, true), true);
-  assert.equal(B.leaseRespectsLocalOnly({ id: "cloud", kind: "cloud" }, true), false,
-    "a broker that ignored localOnly must not get to hand the command to a cloud model");
-  assert.equal(B.leaseRespectsLocalOnly({ id: "old" }, true), false, "no kind is not proof of local");
-  assert.equal(B.leaseRespectsLocalOnly({ id: "cloud", kind: "cloud" }, false), true);
+test("the broker bridge does not expose guard-side lease selection", () => {
+  assert.equal("leaseRespectsLocalOnly" in B, false,
+    "the routed classifier leaves lease policy entirely to the broker");
 });
 
 test("duplicate real-session failure and forget reports do not extend the circuit or retain the lease", async () => {

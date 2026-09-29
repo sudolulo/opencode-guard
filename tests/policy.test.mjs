@@ -600,16 +600,15 @@ test("the reveal window opens and closes on a deadline", () => {
 
 // The no-think kwarg is a body key on a raw pass-through, so WHICH calls get it is
 // the whole safety question: a local coding agent shares the provider and keeps its
-// thinking, and cloud classifier agents must never be handed the key.
-test("localNoThinkApplies scopes the no-think kwarg to local classifier agents", () => {
-  const agents = ["classifier-cloud", "classifier-local"];
+// thinking, and cloud calls must never be handed the key.
+test("localNoThinkApplies scopes the no-think kwarg to the fixed routed classifier", () => {
   const providers = ["llamacpp"];
-  assert.equal(P.localNoThinkApplies("classifier-local", "llamacpp", agents, providers), true);
-  assert.equal(P.localNoThinkApplies("build", "llamacpp", agents, providers), false, "the local coder keeps its thinking");
-  assert.equal(P.localNoThinkApplies("classifier-cloud", "anthropic", agents, providers), false, "cloud agents never see the key");
-  assert.equal(P.localNoThinkApplies(undefined, "llamacpp", agents, providers), false);
-  assert.equal(P.localNoThinkApplies("classifier-local", undefined, agents, providers), false);
-  assert.equal(P.localNoThinkApplies("classifier-local", "llamacpp", agents, []), false, "an empty provider list leaves the hook inert");
+  assert.equal(P.localNoThinkApplies("fleet-classifier", "llamacpp", providers), true);
+  assert.equal(P.localNoThinkApplies("standard", "llamacpp", providers), false, "the local coder keeps its thinking");
+  assert.equal(P.localNoThinkApplies("fleet-classifier", "anthropic", providers), false, "cloud calls never see the key");
+  assert.equal(P.localNoThinkApplies(undefined, "llamacpp", providers), false);
+  assert.equal(P.localNoThinkApplies("fleet-classifier", undefined, providers), false);
+  assert.equal(P.localNoThinkApplies("fleet-classifier", "llamacpp", []), false, "an empty provider list leaves the hook inert");
 });
 
 test("directFallbackWarranted sends only cheap direct faults to the routed ladder", () => {

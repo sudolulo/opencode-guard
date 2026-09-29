@@ -26,10 +26,15 @@ test("no file and no environment means no direct lane, and nothing is invented",
   assert.equal(config.url, null);
   assert.equal(config.model, null, "no baked-in model");
   assert.equal(config.authToken, null, "no baked-in token");
-  assert.deepEqual(config.brokerAgents, {}, "no baked-in broker agents");
+  assert.equal(config.brokerAgents, undefined, "the routed classifier has no target-to-agent map");
   assert.equal(config.broker, true);
   assert.equal(config.private, false);
   assert.equal(config.system, SYSTEM);
+});
+
+test("brokerAgents is not part of the classifier configuration contract", () => {
+  const config = configFrom({ brokerAgents: { legacy: "pinned-classifier" } });
+  assert.equal(config.brokerAgents, undefined);
 });
 
 test("a garbage file changes nothing", () => {

@@ -12,6 +12,7 @@
 // restrictive.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -96,6 +97,52 @@ test("a local-only lease must name a local target", () => {
     "a broker that ignored localOnly must not get to hand the command to a cloud model");
   assert.equal(B.leaseRespectsLocalOnly({ id: "old" }, true), false, "no kind is not proof of local");
   assert.equal(B.leaseRespectsLocalOnly({ id: "cloud", kind: "cloud" }, false), true);
+});
+
+test("duplicate real-session failure and forget reports do not extend the circuit or retain the lease", async () => {
+  const fixtureDir = join(home, "duplicate-report-broker");
+  mkdirSync(fixtureDir, { recursive: true });
+  const socketPath = B.brokerSocket(fixtureDir);
+  const leases = { ses_classifier: { targetID: "local-classifier" } };
+  const circuits = {};
+  const calls = [];
+  let clock = 1_000;
+  const server = http.createServer((request, response) => {
+    let text = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { text += chunk; });
+    request.on("end", () => {
+      const body = text ? JSON.parse(text) : {};
+      calls.push({ path: request.url, body });
+      if (request.url === "/failure") {
+        const targetID = body.targetID ?? leases[body.sessionID]?.targetID;
+        if (targetID) {
+          circuits[targetID] ??= { until: clock + 5_000 };
+          delete leases[body.sessionID];
+        }
+      }
+      if (request.url === "/forget") delete leases[body.sessionID];
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end("{}");
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const report = { sessionID: "ses_classifier", error: "provider exploded" };
+    await B.brokerRequest("/failure", report, { dir: fixtureDir });
+    const firstUntil = circuits["local-classifier"].until;
+    clock += 1_000;
+    await B.brokerRequest("/failure", report, { dir: fixtureDir });
+    await B.brokerRequest("/forget", { sessionID: "ses_classifier" }, { dir: fixtureDir });
+    await B.brokerRequest("/forget", { sessionID: "ses_classifier" }, { dir: fixtureDir });
+
+    assert.equal(leases.ses_classifier, undefined, "the real-session lease is gone");
+    assert.equal(circuits["local-classifier"].until, firstUntil, "a duplicate failure cannot extend the circuit");
+    assert.deepEqual(calls.map((call) => call.path), ["/failure", "/failure", "/forget", "/forget"]);
+    assert.equal(calls.some((call) => "targetID" in call.body), false, "the guard reports by real session only");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 process.on("exit", () => { try { rmSync(home, { recursive: true, force: true }); } catch {} });

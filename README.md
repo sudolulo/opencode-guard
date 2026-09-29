@@ -133,7 +133,9 @@ command to run.
 | `extraBody` | Merged into the request body. A key set to `null` removes a default (`temperature`, `top_p`, `seed`, `max_tokens: 8`). For llama.cpp with a thinking model: `{ "chat_template_kwargs": { "enable_thinking": false } }`. |
 | `promptAddendum` | Site rules appended to the built-in prompt, taking precedence over it, e.g. an operation that is routine on your machines but on the built-in RISKY list. |
 | `systemPrompt` | Replaces the built-in prompt entirely. |
-| `broker`, `brokerDir`, `brokerAgents`, `noThinkProviders` | The optional broker lane, below. |
+| `broker` | `false` disables the optional broker lane. |
+| `brokerDir` | Broker state directory when it is not `~/.local/share/opencode/model-routing`. |
+| `noThinkProviders` | Provider ids whose routed `fleet-classifier` calls receive llama.cpp's no-thinking option. Default: `["llamacpp"]`. |
 
 A hosted endpoint:
 
@@ -151,9 +153,10 @@ leaves the machine.
 for opencode. When its socket exists (`~/.local/share/opencode/model-routing/broker.sock`,
 or `brokerDir`), the guard uses it in two ways. It reads the session's routing
 profile, so that a privacy profile's command text never reaches a cloud classifier.
-And it adds a second classifier lane: the guard leases a classifier target from the
-broker and runs it as a disposable child session through an opencode agent named in
-`brokerAgents` (see `examples/agents/` and `examples/classifier.broker.example.json`).
+And it adds a second classifier lane: the guard creates one disposable, unpinned
+`fleet-classifier` child (see [the complete agent example](https://github.com/sudolulo/opencode-guard/blob/main/examples/agents/fleet-classifier.md)). The broker's
+ordinary `chat.message` route owns that child's single classifier lease, model and
+reasoning variant; the guard owns its prompt, timeout and cleanup.
 The direct endpoint is tried first when both exist; the broker lane is the fallback
 when the direct one fails fast. `"broker": false` turns the lane off.
 
@@ -376,9 +379,9 @@ With opencode-broker installed, a session can carry a privacy profile (`local`,
 treated as one whose command text may not leave local infrastructure, including
 names the guard has never seen: the check is on the shape of the name, not a list,
 because a list would fail open the day the broker gains a profile. Such a session
-is classified only by a direct endpoint marked `private`, or by a broker lease
-requested with `localOnly`, whose target must come back as local. With neither, the
-command is refused, not sent.
+is classified only by a direct endpoint marked `private`, or by a `fleet-classifier`
+child whose broker route inherits that confinement from its owner and selects a local
+target. With neither, the command is refused, not sent.
 
 ### What it is not
 

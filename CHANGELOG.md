@@ -5,6 +5,24 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.2.0] — 2026-09-29
+
+### Changed
+
+- **Classifier model selection is broker-native.** The guard creates one unpinned
+  `fleet-classifier` child and lets opencode-broker's ordinary `chat.message` route
+  own its classifier lease, model and reasoning variant. The guard no longer
+  pre-leases a target or maps target ids to pinned agents through `brokerAgents`.
+- **Classifier failures and cleanup use the real child session id.** Genuine
+  provider or transport failures are reported without a synthetic lease or target
+  id, and every created child is forgotten after abort/status/delete cleanup even
+  when deletion must be deferred. Timeout and empty-text results still do not
+  indict a provider; duplicate failure or forget reports remain idempotent.
+- **llama.cpp no-thinking follows one fixed identity.** Only `fleet-classifier`
+  calls on a provider listed by `noThinkProviders` receive
+  `chat_template_kwargs.enable_thinking: false`; ordinary agents on the same local
+  provider keep their reasoning.
+
 ## [1.1.0] — 2026-09-21
 
 ### Added

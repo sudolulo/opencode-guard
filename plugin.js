@@ -44,9 +44,8 @@
 // permission that has already been raised. That is why auto mode refuses rather
 // than asks: the alternative is a modal on every gray command, which is manual mode.
 //
-// The classifier is whatever ~/.config/opencode/classifier.json names (any
-// OpenAI-compatible endpoint), with opencode-broker as an optional second lane when
-// it is running -- see lib/classifier.js and lib/broker.js. Without either,
+// The classifier is either the direct endpoint named by classifier.json or one
+// unpinned `fleet-classifier` child routed by opencode-broker. Without either,
 // unattended and auto shell commands that are not static reads are refused.
 //
 // Decisions are logged to ~/.local/share/opencode/autoclass.log. The tiers live
@@ -58,7 +57,7 @@
 // own tool.execute.before hook -- hooks from different plugins all run, so a throw
 // from either blocks the tool.
 import { readFileSync, appendFileSync, statSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
-import { randomUUID, createHash } from "node:crypto";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -77,7 +76,7 @@ import {
   agentCapability, dispatchRefusal, staleToolRefusal, sessionIdle,
   nativeToolWritesControlFile, commandWritesControlFile,
 } from "./lib/policy.js";
-import { brokerAvailable, brokerRequest, leaseRespectsLocalOnly, resolveProfileFor } from "./lib/broker.js";
+import { brokerAvailable, brokerRequest, resolveProfileFor } from "./lib/broker.js";
 import { classifierConfig, classifierRoute, classifyDirect, verdictFromText } from "./lib/classifier.js";
 import { createLoopGuard, createLoopGuardHook, loopGuardOptions } from "./lib/loop-guard.js";
 import { createNotifier } from "./lib/notify.js";
@@ -125,10 +124,8 @@ const MODE_DIR = join(homedir(), ".local/share/opencode/modes");
 const MODE_FLAG = join(homedir(), ".config/opencode/mode");
 const REVEAL_FLAG = join(homedir(), ".config/opencode/reveal");
 const LOG = join(homedir(), ".local/share/opencode/autoclass.log");
-// The broker lane's budget. An agent pinned for this lane (examples/agents/) must be
-// able to answer in one word inside it -- and for a reasoning model that is a
-// property of how it is driven: one measured lane answered 6/6 correctly but blew
-// this budget on 2 of 6 at its default reasoning effort, and on none at `none`.
+// The broker lane's budget. The routed fleet-classifier must answer in one word
+// inside it; the broker selects the model and reasoning variant for that child.
 const CLASSIFIER_TIMEOUT_MS = 12_000;
 // How long a broker-lane classifier's disposable session may take to go idle after
 // its abort before cleanup gives up and leaves it (logged as classifier-cleanup-deferred).
@@ -350,51 +347,17 @@ const modeFor = async (sessionID) => {
     log(`redacted(${count})`, String(output?.title ?? input.tool));
   };
 
-  // The broker lane: lease a classifier target, run it as a disposable child
-  // session of the requesting one, and clean that session up. For a privacy
-  // profile the lease asks for `localOnly`, and a lease that still names a cloud
-  // target is refused here rather than used.
-  const classifyRouted = async (command, cwd, parentSessionID, config, localOnly) => {
-    // The broker needs an ID before it selects a model, while OpenCode allocates
-    // the actual session ID during creation. Keep broker accounting on this
-    // disposable lease ID, then use the returned OpenCode ID for every API call.
-    const leaseID = `guard-classifier-${randomUUID()}`;
+  // The broker lane: create one ordinary routed classifier child and clean it up.
+  // The broker's chat.message hook owns model selection and the child's one lease;
+  // the guard owns the child lifecycle and reports against its real session ID.
+  const classifyRouted = async (command, cwd, parentSessionID, config) => {
     let sessionID = null;
-    let target = null;
-    let created = false;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CLASSIFIER_TIMEOUT_MS);
     try {
       if (typeof parentSessionID !== "string" || !parentSessionID.startsWith("ses")) {
         throw new Error("classifier requires an OpenCode parent session");
       }
-      // Declare the request size. The broker REFUSES a local target outright when the
-      // lease carries no contextTokens (a missing estimate must never admit a local
-      // model), so without this a local classifier target is configured but
-      // permanently unreachable. This prompt is bounded and fully
-      // known here -- system prompt plus one cwd and one command -- so the estimate is
-      // honest rather than a placeholder. ~4 chars/token, plus headroom for the reply.
-      const promptChars = String(config?.system ?? SYSTEM).length +
-        String(cwd ?? "").length + String(command ?? "").length;
-      const contextTokens = Math.ceil(promptChars / 4) + 256;
-      const lease = await brokerRequest("/lease", {
-        sessionID: leaseID,
-        profile: "auto",
-        tier: "classifier",
-        contextTokens,
-        ...(localOnly ? { localOnly: true } : {}),
-      }, { timeout: 1500, dir: config?.brokerDir });
-      const leased = lease?.target;
-      if (!leased?.model?.providerID || !leased?.model?.id) throw new Error("broker returned no classifier target");
-      if (!leaseRespectsLocalOnly(leased, localOnly)) {
-        // Not a fault of the target, so it is not reported as one (target stays null).
-        throw new Error(`broker leased non-local target ${leased.id} for a local-only classification`);
-      }
-      target = leased;
-      const classifierAgent = typeof config?.brokerAgents?.[target.id] === "string"
-        ? config.brokerAgents[target.id]
-        : null;
-      if (!classifierAgent) throw new Error(`no classifier agent configured for broker target: ${target.id}`);
 
       // A classifier must be a child of the requesting session. Root sessions made
       // through the V2 endpoint do not inherit this embedded instance's OAuth
@@ -402,9 +365,7 @@ const modeFor = async (sessionID) => {
       const createdSession = await v2Client().session.create({
         parentID: parentSessionID,
         title: "opencode-guard command classifier",
-        // Let the agent's pinned model resolve provider auth. Explicit V2 model
-        // switches store only a model reference and bypass that resolved auth path.
-        agent: classifierAgent,
+        agent: "fleet-classifier",
       }, { signal: controller.signal });
       // Hey wraps the HTTP response in `data`, and the OpenCode V2 endpoint wraps
       // its SessionV2Info in another `data`. Accept either response style so the
@@ -413,8 +374,6 @@ const modeFor = async (sessionID) => {
       if (typeof sessionID !== "string" || !sessionID.startsWith("ses")) {
         throw new Error("OpenCode did not return a classifier session ID");
       }
-      created = true;
-
       // The legacy prompt endpoint runs through the same authenticated provider
       // resolution as an ordinary Task child and returns the completed assistant
       // message. The V2 prompt endpoint cannot carry the resolved OAuth context.
@@ -423,7 +382,7 @@ const modeFor = async (sessionID) => {
         query: { directory },
         signal: controller.signal,
         body: {
-          agent: classifierAgent,
+          agent: "fleet-classifier",
           system: config?.system ?? SYSTEM,
           tools: {},
           parts: [{ type: "text", text: `cwd: ${cwd}\ncommand: ${command}\n\nReply SAFE or RISKY only.` }],
@@ -480,13 +439,13 @@ const modeFor = async (sessionID) => {
       // provider error indicts; the lease is released in `finally` either way.
       // Empty/timeout falls back to the safe default without touching provider
       // health.
-      if (target?.id && !aborted && !noText) {
-        try { await brokerRequest("/failure", { sessionID: leaseID, targetID: target.id, error: detail }, { dir: config?.brokerDir }); } catch {}
+      if (sessionID && !aborted && !noText) {
+        try { await brokerRequest("/failure", { sessionID, error: detail }, { dir: config?.brokerDir }); } catch {}
       }
       return `error:${detail}`;
     } finally {
       clearTimeout(timer);
-      if (created) {
+      if (sessionID) {
         // The classifier timeout aborts the HTTP client, not necessarily the server-side
         // agent loop. Deleting immediately raced that loop's final step-start write and
         // turned a routine timeout into a SQLite foreign-key error. Stop the disposable
@@ -517,8 +476,8 @@ const modeFor = async (sessionID) => {
           // not proved it is idle; a later operator cleanup can remove the row safely.
           log("classifier-cleanup-deferred", `${sessionID} ${error?.message ?? error}`);
         }
+        try { await brokerRequest("/forget", { sessionID }, { dir: config?.brokerDir }); } catch {}
       }
-      try { await brokerRequest("/forget", { sessionID: leaseID }, { dir: config?.brokerDir }); } catch {}
     }
   };
 
@@ -535,7 +494,7 @@ const modeFor = async (sessionID) => {
       if (!broker || !directFallbackWarranted(verdict)) return verdict;
       log(`direct classifier ${verdict}, falling back to the broker`, command);
     }
-    if (broker) return classifyRouted(command, cwd, sessionID, config, route.localOnly);
+    if (broker) return classifyRouted(command, cwd, sessionID, config);
     return "error:no-classifier";
   };
 
@@ -638,12 +597,12 @@ const modeFor = async (sessionID) => {
     // in auto mode rather than a slower one. llama.cpp honours exactly one no-think
     // lever (see localNoThinkApplies), and this hook sets it on the broker lane's
     // own model calls. The direct lane sets it through classifier.json extraBody.
-    // Scoped to a classifier agent ON a listed provider, deliberately: a local
-    // coding agent on the same provider keeps its thinking, and cloud classifier
-    // agents must never be handed this key.
+    // Scoped to the fixed classifier identity ON a listed provider, deliberately:
+    // a local coding agent on the same provider keeps its thinking, and cloud calls
+    // must never be handed this key.
     "chat.params": async (input, output) => {
-      const { brokerAgents, noThinkProviders } = classifierConfig();
-      if (!localNoThinkApplies(input?.agent, input?.provider?.id, Object.values(brokerAgents), noThinkProviders)) return;
+      const { noThinkProviders } = classifierConfig();
+      if (!localNoThinkApplies(input?.agent, input?.provider?.id, noThinkProviders)) return;
       output.options = {
         ...output.options,
         chat_template_kwargs: { ...output.options?.chat_template_kwargs, enable_thinking: false },

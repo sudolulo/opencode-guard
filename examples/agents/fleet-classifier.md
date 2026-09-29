@@ -1,8 +1,7 @@
 ---
-description: One-shot shell command classifier on a local model, for opencode-guard's broker lane. Not for interactive use.
+description: One-shot routed shell command classifier for opencode-guard. Not for interactive use.
 mode: all
 hidden: true
-model: llamacpp/qwen3-4b-instruct
 temperature: 0
 tools: {}
 permission:

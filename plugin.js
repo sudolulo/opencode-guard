@@ -71,7 +71,7 @@ import { pathToFileURL } from "node:url";
 import {
   normalizeLevel, normalizeMode, normalizeGlobalMode, resolveSessionMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
   commandUnder, credentialAdvice, siteConfig,
-  strip, commandIsRead, launderReason, bashRulesLoad, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
+  strip, commandIsRead, launderReason, bashRulesLoad, parserError, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
   agentCapability, dispatchRefusal, staleToolRefusal, sessionIdle,
   nativeToolWritesControlFile, commandWritesControlFile,
@@ -180,11 +180,23 @@ export const OpencodeGuard = async ({ client, directory }) => {
   // An opencode config the guard cannot read makes the launder floor fail closed
   // (it then judges every command as natively allowed). That must not be silent:
   // it means the guard and opencode no longer agree on what runs unprompted.
+  const reportError = async (kind, message) => {
+    log(kind, message);
+    try {
+      await client?.app?.log?.({ body: { service: "opencode-guard", level: "error", message } });
+    } catch (error) {
+      log(`${kind}-unreported`, error?.message ?? error);
+    }
+  };
   if (bashRulesLoad.error) {
-    const message = `opencode-guard: could not read the opencode permission config (${bashRulesLoad.error}); ` +
-      "the launder floor is judging every command as allowed until it can";
-    log("config-error", message);
-    try { await client?.app?.log?.({ body: { service: "opencode-guard", level: "error", message } }); } catch {}
+    await reportError("config-error", `opencode-guard: could not read the opencode permission config (${bashRulesLoad.error}); ` +
+      "the launder floor is judging every command as allowed until it can");
+  }
+  // Without the bash parser the launder floor cannot see into loops, subshells or
+  // substitutions, so it refuses every command that has them until this is fixed.
+  if (parserError) {
+    await reportError("parser-error", `opencode-guard: the bash parser did not load (${parserError}); ` +
+      "the launder floor refuses commands with compound syntax until it does");
   }
   const handled = new Set();
   // Denials raised by a DELEGATED child, keyed by the parent session that dispatched

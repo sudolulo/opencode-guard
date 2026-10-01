@@ -5,6 +5,43 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.4.0] — 2026-10-01
+
+### Changed
+
+- ☠️ **The launder floor parses commands the way opencode does.** opencode checks
+  permission once per `command` node of a tree-sitter bash parse -- including
+  commands inside loops, `if` bodies, subshells, `{ }` groups and `$( )`/backtick
+  substitutions. The floor used a hand lexer that only split on `; & | newline`, so
+  `for f in a; do echo x > ~/.bashrc; done`, `(echo x > ~/.bashrc)`,
+  `x=$(fd -x rm)` and an apostrophe in a heredoc body (which hid every command
+  after it) all ran unprompted with no floor. It now uses the same parser and
+  pinned versions as opencode (`web-tree-sitter` 0.25.10, `tree-sitter-bash`
+  0.25.0, new dependencies -- run `npm install` after pulling) and judges every
+  command node against its own source text. A redirect on any statement whose
+  commands would all run unprompted is refused, including `(cat a) > f` and a
+  bare `> f`. If the parser cannot load, the plugin and `oc-check` report it and the
+  floor refuses any command with compound syntax until it does.
+- **An allowed command the guard cannot verify is refused.** A command the config
+  lets run unprompted must now be a known read verb whose arguments keep it one, or
+  a named exemption (`opencode session`, `rm` under its own deny floor, `git
+  fetch`). Before, an unknown verb was waved through: `git fetch*` let
+  `git fetch-pack --exec=cmd` run.
+- **Redirect targets are judged as the program sees them.** Quotes are removed
+  (`> "/dev/null"` is harmless) and a `/tmp/opencode/` target must be a literal
+  path that stays inside it after normalising (`/tmp/opencode/$d` is refused). A
+  destination built from several parts is read whole.
+- **More read guards.** `sed` is a read only for known read-only scripts
+  (addresses with `p = d l n N q Q`, `s///` with `g p i I` flags; never `w`, `e`,
+  `r`, `-i` or any `--in...` prefix, `-f`); `sort -o` in a cluster and any
+  `--output` prefix; `yq -s/--split-exp`; `mediainfo --LogFile`; `ag --pag...`;
+  `git ls-remote --upload-pack`. `rtk --version` is a read. Inherited object keys
+  (`toString`) are no longer looked up as verbs.
+- The opencode config is found where opencode looks (`$XDG_CONFIG_HOME/opencode`),
+  and a leading `~`/`$HOME` in a pattern is expanded as opencode does. Compiled
+  patterns are cached. A failure to report a config error is logged instead of
+  swallowed.
+
 ## [1.3.1] — 2026-10-01
 
 ### Fixed

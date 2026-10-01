@@ -241,11 +241,16 @@ Three checks run on every process-spawning tool call (`bash`, and `pty_spawn`,
    without asking (its last-match-wins verdict is recomputed from the global
    config the way opencode reads it: `config.json`, `opencode.json` and
    `opencode.jsonc`, JSONC, over opencode's `"*": "allow"` default; a config that
-   cannot be read fails closed and is reported), the floor re-reads the lexed arguments and
-   refuses a redirect into a file (anything but `/dev/null`, fd merges, or
-   `/tmp/opencode/`) or a read verb whose guard (below) says it writes or runs a
-   program. Segments opencode would ask about are not judged: a person approved
-   those.
+   cannot be read fails closed and is reported), the floor parses the command with
+   the same tree-sitter bash parser opencode uses and judges every command node --
+   inside loops, subshells, groups and substitutions too. It refuses a redirect
+   into a file (anything but `/dev/null`, fd merges, or a literal path inside
+   `/tmp/opencode/`) on a statement whose commands would all run unprompted, a read
+   verb whose guard (below) says it writes or runs a program, and an allowed command
+   it cannot verify as a read at all. Commands opencode would ask about are not
+   judged: a person approved those. The parser is a dependency (`npm install`); if
+   it cannot load, the plugin and `oc-check` say so and the floor refuses any
+   command with compound syntax.
 3. **The credential guard.** Paths such as `~/.ssh/id_*`, `~/.aws/credentials`,
    `~/.kube/config`, `~/.docker/config.json`, `~/.gnupg/` and `/etc/shadow`, plus
    the site's own, are refused outright. Password-manager reads are refused when

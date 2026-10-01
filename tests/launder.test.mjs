@@ -17,15 +17,17 @@ writeFileSync(join(home, ".config/opencode/opencode.json"), JSON.stringify({ per
 
 const P = await import(new URL("../lib/policy.js", import.meta.url).href);
 
-// A slice of the real fleet rules: every read verb under test is allowed, plus the
+// A slice of the real fleet rules, in the real order (the rm -rf floor, then its
+// registered /tmp/opencode exception): every read verb under test is allowed, plus the
 // snip twins the real config carries.
 const RULES = [
   ["*", "ask"],
-  ...["echo *", "cat *", "fd *", "rg *", "rtk rg *", "git diff*", "git log*", "git show*", "git --no-pager diff*",
-    "rtk git diff*", "git fetch*", "git grep*", "git remote*", "git branch*", "tree *", "uniq *", "xxd *",
-    "pdftotext *", "yq *", "xmllint *", "bat *", "ag *", "npm test*", "ls *", "rm -rf /tmp/opencode/*"]
-    .flatMap((p) => [[p, "allow"], ["snip " + p, "allow"]]),
   ["rm -rf /*", "deny"],
+  ...["echo *", "cat *", "fd *", "rg *", "rtk rg *", "rtk --version", "git diff*", "git log*", "git show*",
+    "git --no-pager diff*", "rtk git diff*", "git fetch*", "git grep*", "git remote*", "git branch*", "tree *",
+    "uniq *", "xxd *", "pdftotext *", "yq *", "xmllint *", "bat *", "ag *", "ls *", "rm -rf /tmp/opencode/*",
+    "opencode session delete *"]
+    .flatMap((p) => [[p, "allow"], ["snip " + p, "allow"]]),
 ];
 
 test("nativeBashVerdict reproduces opencode's wildcard matcher", () => {
@@ -36,7 +38,8 @@ test("nativeBashVerdict reproduces opencode's wildcard matcher", () => {
   assert.equal(v("git diff HEAD"), "allow");
   assert.equal(v("git difftool"), "allow", "`git diff*` has no space, so it matches difftool -- the reason this floor exists");
   assert.equal(v("rm -rf /etc"), "deny");
-  assert.equal(v("rm -rf /tmp/opencode/x"), "deny", "last match wins: a later deny overrides an earlier allow");
+  assert.equal(v("rm -rf /tmp/opencode/x"), "allow", "last match wins: the later exception overrides the floor");
+  assert.equal(v("a", [["*", "ask"], ["a", "allow"], ["a", "deny"]]), "deny", "and a later deny overrides an earlier allow");
   assert.equal(v("x", [["*", "ask"], ["?", "allow"]]), "allow", "? is exactly one character");
   assert.equal(v("xy", [["*", "ask"], ["?", "allow"]]), "ask");
   assert.equal(v("cat a\\b", [["*", "ask"], ["cat a/b", "allow"]]), "allow", "backslashes compare as slashes");
@@ -61,6 +64,19 @@ const LAUNDER = [
   "pdftotext a.pdf out.txt", "yq -i .a=1 f.yml", "yq -Pi .a=1 f.yml", "xmllint --output o x.xml",
   "bat --pager=sh f", "ag --pager sh foo",
   "snip fd -HX rm -rf",
+  // opencode checks every command node, inside loops, subshells, groups, substitutions
+  "for f in a; do echo x > /home/dev/.bashrc; done", "(echo x > /home/dev/.bashrc)", "{ fd -x rm {}; }",
+  "if true; then fd -x rm {}; fi", "x=$(fd -x rm {})", "echo $(fd -x rm {})", "cat `fd -x rm {}`",
+  // a redirect on a compound statement whose commands all run unprompted
+  "(cat a) > /home/dev/.bashrc", "{ cat a; ls; } > /home/dev/.bashrc", "> /home/dev/.bashrc",
+  // an apostrophe in a heredoc body must not hide the commands after it
+  "cat <<EOF\ndon't\nEOF\necho x > /home/dev/.bashrc",
+  // /tmp/opencode only when the target is literal
+  "echo x > /tmp/opencode/$d", "echo x > /tmp/opencode/`echo ..`/x",
+  // natively allowed but not a known read: fetch-pack matches git fetch*
+  "git fetch-pack --exec=cmd .",
+  // abbreviated long options
+  "ag --pag=sh foo",
 ];
 
 test("a natively-allowed read verb that writes or executes has a launder reason", () => {
@@ -81,6 +97,9 @@ const CLEAN = [
   "uniq -c f", "uniq -f 1 f", "xxd f", "xxd -l 16 f", "pdftotext a.pdf -", "pdftotext -l 2 a.pdf -",
   "tree -L 2", "yq .a f.yml", "xmllint --noout x.xml", "bat f", "ag foo",
   "npm test 2>&1 | tail -5", "cd /work && rg foo",
+  'cat a > "/dev/null"', 'echo x > "/tmp/opencode/y"', "cat <<'EOF' > /tmp/opencode/x.sh\necho hi > out\nEOF",
+  "rtk --version", "opencode session delete ses_x", "rm -rf /tmp/opencode/scratch", "for f in a b; do cat $f; done",
+  "echo $(git rev-parse HEAD)", "(cd /work && rg foo)",
 ];
 
 test("ordinary reads, and harmless redirects, have no launder reason", () => {
@@ -106,8 +125,10 @@ test("every output-redirect spelling is seen, and the reason names the real targ
 // opencode.jsonc from the global config dir, JSONC (comments, trailing commas),
 // on top of opencode's built-in `"*": "allow"` default. A file that exists but
 // cannot be read or parsed fails CLOSED: every segment is judged as allowed.
+const createdDirs = [];
 const configDir = (files) => {
   const dir = mkdtempSync(join(tmpdir(), "guard-launder-cfg-"));
+  createdDirs.push(dir);
   for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
   return dir;
 };
@@ -162,11 +183,15 @@ test("the strict read checks also tighten auto-mode read classification", () => 
   // but "*": ask, so there is no config shortcut.
   for (const command of ["fd -HX rm -rf", "rg --pre sh x", "git diff --output=f", "git branch -vD main",
     "git grep -iOx -e y", "git remote -v set-url origin x", "uniq a b", "xxd -r a b", "tree -o f",
-    "pdftotext a.pdf", "yq -i .a=1 f", "bat --pager=sh f", "exiftool -if 'system(1)' f"]) {
+    "pdftotext a.pdf", "yq -i .a=1 f", "bat --pager=sh f", "exiftool -if 'system(1)' f",
+    "sed -n '1w /home/dev/.bashrc' f", "sed -n '1e touch x' f", "sed -n 's/a/b/w out' f", "sed --in=.bak -n p f",
+    "sed -f script f", "sort --out=f a", "sort -rof a", "git ls-remote --upload-pack=x .", "yq -s '.a' f",
+    "mediainfo --LogFile=out f", "toString x"]) {
     assert.equal(P.commandIsRead(command), false, `must not be a static read: ${command}`);
   }
   for (const command of ["fd -e md", "rg foo", "git diff HEAD", "git branch -vv", "git remote -v",
-    "uniq -c f", "xxd f", "tree -L 2", "pdftotext a.pdf -", "yq .a f"]) {
+    "uniq -c f", "xxd f", "tree -L 2", "pdftotext a.pdf -", "yq .a f",
+    "sed -n '1,5p' f", "sed -n '/foo/p' f", "sed 's/a/b/g' f", "sed -n -e '1p' -e '3p' f", "sort -k2 f"]) {
     assert.equal(P.commandIsRead(command), true, `must stay a static read: ${command}`);
   }
 });
@@ -228,4 +253,21 @@ test("the hook blocks a laundered write in manual, edits and auto, and stands as
     "a natively-asked command was approved by a person and runs");
 });
 
-process.on("exit", () => rmSync(home, { recursive: true, force: true }));
+test("the bash parser loads, so compound syntax is judged command by command", () => {
+  assert.equal(P.parserError, null, "web-tree-sitter and tree-sitter-bash must be installed (npm install)");
+});
+
+test("without the parser, the fallback refuses compound syntax and still judges simple commands", () => {
+  for (const command of ["for f in a; do echo x > /home/dev/.bashrc; done", "(echo hi)", "echo $(fd -x rm)", "cat <<EOF\nx\nEOF"]) {
+    assert.ok(P.launderReasonLex(command, RULES), `fallback must refuse: ${command}`);
+  }
+  assert.ok(P.launderReasonLex("echo x > /home/dev/.bashrc", RULES));
+  assert.ok(P.launderReasonLex("fd -HX rm -rf", RULES));
+  assert.equal(P.launderReasonLex("echo hi", RULES), null);
+  assert.equal(P.launderReasonLex("cat a > /tmp/opencode/x", RULES), null);
+});
+
+process.on("exit", () => {
+  rmSync(home, { recursive: true, force: true });
+  for (const dir of createdDirs) rmSync(dir, { recursive: true, force: true });
+});

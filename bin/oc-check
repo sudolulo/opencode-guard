@@ -64,6 +64,10 @@ if (/\boc-reveal\b/.test(command) || /\.config\/opencode\/reveal\b/.test(command
   if (v.kind === "unavailable") {
     console.log("floor:   cc-safety-net unavailable -- skipped (the plugin logs the same and falls through)");
   }
+  if (!floor) {
+    const laundered = P.launderReason(command);
+    if (laundered) floor = `launder floor (\`${laundered.segment}\` is allowed by a read rule, but ${laundered.reason})`;
+  }
 }
 
 if (floor) {

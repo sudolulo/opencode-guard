@@ -228,13 +228,23 @@ too often teaches people to stop reading what it asks.
 
 ### The floor
 
-Two checks run on every process-spawning tool call (`bash`, and `pty_spawn`,
+Three checks run on every process-spawning tool call (`bash`, and `pty_spawn`,
 `pty_write` and `bg_run` from pty and background-shell plugins) in every mode but
 `god`:
 
 1. **cc-safety-net** static analysis. A deny verdict throws. So does an exception
    from the analyser: its API contract is that a throw means "do not run it".
-2. **The credential guard.** Paths such as `~/.ssh/id_*`, `~/.aws/credentials`,
+2. **The launder floor.** opencode's own `permission.bash` globs let read verbs run
+   unprompted (`echo *`, `fd *`, `git diff*`), and a glob cannot look inside
+   argv: `echo x > ~/.bashrc`, `fd -HX rm -rf`, `git diff --output=f` and a quoted
+   `rg '--pre' sh` all match a read allow. For every segment opencode would run
+   without asking (its last-match-wins verdict is recomputed from
+   `~/.config/opencode/opencode.json`), the floor re-reads the lexed arguments and
+   refuses a redirect into a file (anything but `/dev/null`, fd merges, or
+   `/tmp/opencode/`) or a read verb whose guard (below) says it writes or runs a
+   program. Segments opencode would ask about are not judged: a person approved
+   those.
+3. **The credential guard.** Paths such as `~/.ssh/id_*`, `~/.aws/credentials`,
    `~/.kube/config`, `~/.docker/config.json`, `~/.gnupg/` and `/etc/shadow`, plus
    the site's own, are refused outright. Password-manager reads are refused when
    nobody is present and left to a prompt when someone is.
@@ -253,7 +263,13 @@ About 140 inspection verbs (`ls`, `rg`, `jq`, `git log`, `docker ps`,
 default and write with one flag, so they carry per-verb guards: `sed` without `-i`,
 `find` without `-exec` or `-delete`, `curl` without a body, upload, output file or
 method flag (matched as prefixes, so `-XPOST` and `-sSLo` are caught), `git branch`
-without `-D`, `kubectl get` of anything but a Secret.
+only listing (write flags in any cluster or abbreviation, or a name without a
+list-mode option, are writes), `git grep` without `-O`, `git diff/log/show` without
+`--output` or `--ext-diff`, `fd` without `-x`/`-X` in any cluster, `rg` without
+`--pre` or `--hostname-bin`, `uniq`/`xxd` with one operand, `xxd` without `-r`,
+`pdftotext` to stdout, `tree` without `-o`, `yq` without `-i`, `bat`/`ag` without
+`--pager`, `kubectl get` of anything but a Secret. `exiftool` is not in the table
+(`-if` runs Perl).
 
 The command line is lexed with quotes honoured and every segment of a pipeline or
 `&&` chain has to be a read on its own, so `cd repo && rg foo` settles while

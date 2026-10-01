@@ -5,6 +5,41 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.3.0] — 2026-10-01
+
+### Added
+
+- ☠️ **The launder floor.** opencode's own allow globs let read verbs run
+  unprompted, and a glob cannot see inside argv, so `echo x > ~/.bashrc`,
+  `fd -HX rm -rf`, `git diff --output=f`, `git grep -O'cmd'`, a quoted
+  `rg '--pre' sh` and `git fetch --upl=cmd` all ran without a prompt in manual and
+  edits mode. For every segment opencode would run without asking -- its
+  last-match-wins verdict recomputed from `~/.config/opencode/opencode.json` with
+  opencode's own wildcard semantics -- the floor now refuses a redirect into a file
+  (other than `/dev/null`, fd merges and `/tmp/opencode/`) or a read verb whose
+  parsed arguments write or run a program. Commands opencode would ask about are
+  not judged. Runs in every mode but attended god; `oc-check` reports it.
+
+### Fixed
+
+- **`&>file` was read as a background `&`.** The lexer ended the command at the
+  `&` and dropped the redirect, so `echo x &> ~/.bashrc` counted as a read in auto
+  mode. `&>`/`&>>` are now redirects, `>|` is recognised, and `>&file` names its
+  file instead of a bare `&`.
+
+### Changed
+
+- **Read guards see clusters, abbreviations and quoting.** `git branch` is a read
+  only when listing (any write flag in a short cluster, any abbreviation of a write
+  long option, or a branch name without a list-mode option is a write); `git
+  remote -v set-url` is no longer a read; new guards for `fd` (`-x`/`-X` in any
+  cluster, `--exec`), `rg` (`--pre`, `--hostname-bin`), `git grep` (`-O`,
+  `--open-files-in-pager`), `git diff/log/show/whatchanged` (`--output`,
+  `--ext-diff`), `tree -o`, `uniq`/`xxd` with an output operand, `xxd -r`,
+  `pdftotext` writing a file, `yq -i`, `xmllint --output`, `bat`/`ag --pager`.
+  `exiftool` left the read table (`-if` runs Perl). These also tighten what auto
+  mode settles without a model call.
+
 ## [1.2.0] — 2026-09-29
 
 ### Changed

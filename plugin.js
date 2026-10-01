@@ -71,7 +71,7 @@ import { pathToFileURL } from "node:url";
 import {
   normalizeLevel, normalizeMode, normalizeGlobalMode, resolveSessionMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
   commandUnder, credentialAdvice, siteConfig,
-  strip, commandIsRead, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
+  strip, commandIsRead, launderReason, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
   agentCapability, dispatchRefusal, staleToolRefusal, sessionIdle,
   nativeToolWritesControlFile, commandWritesControlFile,
@@ -698,6 +698,20 @@ const modeFor = async (sessionID) => {
           `[opencode-guard] blocked: ${net.reason} ` +
           `(rule ${net.ruleId ?? "?"}). Do not rephrase to evade this; ` +
           `pick a genuinely safer approach or ask the user.`,
+        );
+      }
+
+      // The launder floor (lib/policy.js): opencode's own allow globs already let this
+      // run unprompted, but its parsed arguments make a read verb write a file or run
+      // a program. A glob cannot see inside argv; this can. Commands opencode would
+      // ask about are not judged here -- a person approved those.
+      const laundered = launderReason(command);
+      if (laundered) {
+        log("deny(launder)", command);
+        throw new Error(
+          `[opencode-guard] blocked: \`${laundered.segment}\` matches an allow rule for a read-only command, ` +
+          `but ${laundered.reason}. Use the Write or Edit tool to write files (a redirect into /tmp/opencode/ is fine), or ask the user to run it. ` +
+          `Do not rephrase to evade this.`,
         );
       }
 

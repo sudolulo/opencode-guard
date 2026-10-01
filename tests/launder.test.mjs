@@ -102,6 +102,53 @@ test("every output-redirect spelling is seen, and the reason names the real targ
   assert.equal(P.launderReason("echo x 2>&1 >&2", RULES), null, "fd merges write nothing");
 });
 
+// The ruleset is read the way opencode reads it: config.json, opencode.json and
+// opencode.jsonc from the global config dir, JSONC (comments, trailing commas),
+// on top of opencode's built-in `"*": "allow"` default. A file that exists but
+// cannot be read or parsed fails CLOSED: every segment is judged as allowed.
+const configDir = (files) => {
+  const dir = mkdtempSync(join(tmpdir(), "guard-launder-cfg-"));
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
+  return dir;
+};
+
+test("loadBashRules starts from opencode's default allow", () => {
+  const empty = P.loadBashRules(configDir({}));
+  assert.deepEqual(empty, { rules: [["*", "allow"]], error: null }, "no config at all: opencode allows bash");
+  const noStar = P.loadBashRules(configDir({ "opencode.json": JSON.stringify({ permission: { bash: { "rm *": "ask" } } }) }));
+  assert.equal(P.nativeBashVerdict("echo x > f", noStar.rules), "allow", "a config without `*` leaves the default allow");
+  assert.ok(P.launderReason("echo x > f", noStar.rules));
+  const str = P.loadBashRules(configDir({ "opencode.json": JSON.stringify({ permission: { bash: "ask" } }) }));
+  assert.equal(P.nativeBashVerdict("echo x > f", str.rules), "ask");
+});
+
+test("loadBashRules reads JSONC and merges the files opencode reads", () => {
+  const dir = configDir({
+    "opencode.json": `{
+      // a comment
+      "permission": { "bash": {
+        "*": "ask", /* block */ "cat *": "allow",
+        "echo // not a comment,}*": "allow",
+      }, },
+    }`,
+    "opencode.jsonc": `{ "permission": { "bash": { "cat *": "ask", "rg *": "allow", } } }`,
+  });
+  const { rules, error } = P.loadBashRules(dir);
+  assert.equal(error, null);
+  assert.equal(P.nativeBashVerdict("echo // not a comment,} x", rules), "allow", "string content survives comment stripping");
+  assert.equal(P.nativeBashVerdict("cat a", rules), "ask", "opencode.jsonc is read after opencode.json and overrides it");
+  assert.equal(P.nativeBashVerdict("rg foo", rules), "allow");
+});
+
+test("an unreadable or unparseable config fails closed and says why", () => {
+  const { rules, error } = P.loadBashRules(configDir({ "opencode.json": "{ not json" }));
+  assert.match(error, /opencode\.json/);
+  assert.deepEqual(rules, [["*", "allow"]], "every segment is judged as natively allowed");
+  assert.ok(P.launderReason("echo x > /home/dev/.bashrc", rules));
+  assert.ok(P.launderReason("fd -HX rm -rf", rules));
+  assert.equal(P.launderReason("echo hi", rules), null, "reads still run");
+});
+
 test("only natively-allowed segments are judged: an approved prompt still runs", () => {
   const rules = [["*", "ask"], ["cat *", "allow"]];
   assert.equal(P.launderReason("git branch -D feature", rules), null, "asked natively, so the person approved it");
@@ -126,20 +173,21 @@ test("the strict read checks also tighten auto-mode read classification", () => 
 
 // Through the real hook, in a subprocess with a throwaway HOME: the plugin reads its
 // files at import.
-const runHook = ({ mode, command }) => {
+const runHook = ({ mode, command, config }) => {
   const h = mkdtempSync(join(tmpdir(), "guard-launder-hook-"));
   try {
     mkdirSync(join(h, ".config/opencode"), { recursive: true });
     mkdirSync(join(h, ".local/share/opencode/modes"), { recursive: true });
-    writeFileSync(join(h, ".config/opencode/opencode.json"), JSON.stringify({
+    writeFileSync(join(h, ".config/opencode/opencode.json"), config ?? JSON.stringify({
       permission: { bash: Object.fromEntries(RULES) },
     }));
     writeFileSync(join(h, ".local/share/opencode/modes/ses_a"), `${mode}\n`);
     const pluginUrl = new URL("../plugin.js", import.meta.url).href;
     const script = `
+      const logs = [];
       const client = {
         session: { status: async () => ({ data: { ses_a: { type: "busy" } } }), get: async () => ({ data: {} }) },
-        app: { log: async () => {} },
+        app: { log: async (entry) => { logs.push(entry?.body ?? entry); } },
       };
       const { OpencodeGuard } = await import(${JSON.stringify(pluginUrl)});
       const hooks = await OpencodeGuard({ client, directory: ${JSON.stringify(h)} });
@@ -147,17 +195,25 @@ const runHook = ({ mode, command }) => {
       try {
         await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_a", callID: "c1" }, { args: { command: ${JSON.stringify(command)} } });
       } catch (error) { outcome = String(error?.message ?? error); }
-      console.log(JSON.stringify({ outcome }));
+      console.log(JSON.stringify({ outcome, logs }));
     `;
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
       env: { ...process.env, HOME: h }, encoding: "utf8",
     });
     assert.equal(child.status, 0, child.stderr);
-    return JSON.parse(child.stdout.trim().split("\n").at(-1)).outcome;
+    const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    return config === undefined ? result.outcome : result;
   } finally {
     rmSync(h, { recursive: true, force: true });
   }
 };
+
+test("with a broken opencode.json the hook still blocks, and reports the config error", () => {
+  const result = runHook({ mode: "manual", command: "echo x > /home/dev/.bashrc", config: "{ not json" });
+  assert.match(result.outcome, /matches an allow rule for a read-only command/);
+  assert.ok(result.logs.some((entry) => entry?.level === "error" && /opencode\.json/.test(entry?.message ?? "")),
+    `expected an error log naming the config, got ${JSON.stringify(result.logs)}`);
+});
 
 test("the hook blocks a laundered write in manual, edits and auto, and stands aside in god", () => {
   for (const mode of ["manual", "edits", "auto"]) {

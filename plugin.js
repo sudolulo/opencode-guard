@@ -71,7 +71,7 @@ import { pathToFileURL } from "node:url";
 import {
   normalizeLevel, normalizeMode, normalizeGlobalMode, resolveSessionMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
   commandUnder, credentialAdvice, siteConfig,
-  strip, commandIsRead, launderReason, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
+  strip, commandIsRead, launderReason, bashRulesLoad, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
   agentCapability, dispatchRefusal, staleToolRefusal, sessionIdle,
   nativeToolWritesControlFile, commandWritesControlFile,
@@ -177,6 +177,15 @@ const controlDeny =
   "in their own terminal. If the change is really needed, say so and let the user make it.";
 
 export const OpencodeGuard = async ({ client, directory }) => {
+  // An opencode config the guard cannot read makes the launder floor fail closed
+  // (it then judges every command as natively allowed). That must not be silent:
+  // it means the guard and opencode no longer agree on what runs unprompted.
+  if (bashRulesLoad.error) {
+    const message = `opencode-guard: could not read the opencode permission config (${bashRulesLoad.error}); ` +
+      "the launder floor is judging every command as allowed until it can";
+    log("config-error", message);
+    try { await client?.app?.log?.({ body: { service: "opencode-guard", level: "error", message } }); } catch {}
+  }
   const handled = new Set();
   // Denials raised by a DELEGATED child, keyed by the parent session that dispatched
   // it. A child that is refused something just returns a thinner answer; without

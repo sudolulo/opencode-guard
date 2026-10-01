@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.3.1] — 2026-10-01
+
+### Fixed
+
+- **An unreadable opencode config silently switched the launder floor off.** The
+  guard read only `opencode.json`, as strict JSON, and a read or parse failure left
+  it with no rules -- so no segment counted as natively allowed and nothing was
+  judged. It now reads the global config the way opencode does (`config.json`,
+  `opencode.json`, `opencode.jsonc`; comments and trailing commas; on top of
+  opencode's built-in `"*": "allow"` default, which a config without a `*` rule
+  leaves in force). A file that exists but cannot be read or parsed fails closed:
+  every segment is judged as allowed, the plugin logs an error at startup naming
+  the file and the reason, and `oc-check` prints it. The auto-mode allow shortcuts
+  come from the same loader and stay empty on an error.
+
 ## [1.3.0] — 2026-10-01
 
 ### Added

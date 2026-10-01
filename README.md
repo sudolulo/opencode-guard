@@ -238,8 +238,10 @@ Three checks run on every process-spawning tool call (`bash`, and `pty_spawn`,
    unprompted (`echo *`, `fd *`, `git diff*`), and a glob cannot look inside
    argv: `echo x > ~/.bashrc`, `fd -HX rm -rf`, `git diff --output=f` and a quoted
    `rg '--pre' sh` all match a read allow. For every segment opencode would run
-   without asking (its last-match-wins verdict is recomputed from
-   `~/.config/opencode/opencode.json`), the floor re-reads the lexed arguments and
+   without asking (its last-match-wins verdict is recomputed from the global
+   config the way opencode reads it: `config.json`, `opencode.json` and
+   `opencode.jsonc`, JSONC, over opencode's `"*": "allow"` default; a config that
+   cannot be read fails closed and is reported), the floor re-reads the lexed arguments and
    refuses a redirect into a file (anything but `/dev/null`, fd merges, or
    `/tmp/opencode/`) or a read verb whose guard (below) says it writes or runs a
    program. Segments opencode would ask about are not judged: a person approved

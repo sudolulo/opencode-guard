@@ -81,7 +81,7 @@ const LAUNDER = [
 
 test("a natively-allowed read verb that writes or executes has a launder reason", () => {
   for (const command of LAUNDER) {
-    assert.ok(P.launderReason(command, RULES), `expected a launder reason for: ${command}`);
+    assert.ok(P.launderReason(command, RULES, RULES), `expected a launder reason for: ${command}`);
   }
 });
 
@@ -104,14 +104,14 @@ const CLEAN = [
 
 test("ordinary reads, and harmless redirects, have no launder reason", () => {
   for (const command of CLEAN) {
-    assert.equal(P.launderReason(command, RULES), null, `unexpected launder reason for: ${command}`);
+    assert.equal(P.launderReason(command, RULES, RULES), null, `unexpected launder reason for: ${command}`);
   }
 });
 
 test("every output-redirect spelling is seen, and the reason names the real target", () => {
   for (const command of ["echo x &> /home/dev/.bashrc", "echo x &>> /home/dev/.bashrc", "echo x >| /home/dev/.bashrc",
     "echo x >&/home/dev/.bashrc", "echo x>/home/dev/.bashrc", "echo x 2>> /home/dev/.bashrc"]) {
-    const result = P.launderReason(command, RULES);
+    const result = P.launderReason(command, RULES, RULES);
     assert.ok(result, `expected a launder reason for: ${command}`);
     assert.match(result.reason, /\/home\/dev\/\.bashrc/, `the reason must name the file for: ${command}`);
   }
@@ -198,7 +198,7 @@ test("the strict read checks also tighten auto-mode read classification", () => 
 
 // Through the real hook, in a subprocess with a throwaway HOME: the plugin reads its
 // files at import.
-const runHook = ({ mode, command, config }) => {
+const runHook = ({ mode, command, config, agent, agents, agentsFail }) => {
   const h = mkdtempSync(join(tmpdir(), "guard-launder-hook-"));
   try {
     mkdirSync(join(h, ".config/opencode"), { recursive: true });
@@ -210,12 +210,19 @@ const runHook = ({ mode, command, config }) => {
     const pluginUrl = new URL("../plugin.js", import.meta.url).href;
     const script = `
       const logs = [];
+      const agents = ${JSON.stringify(agents ?? null)};
+      const agentsFail = ${JSON.stringify(Boolean(agentsFail))};
       const client = {
         session: { status: async () => ({ data: { ses_a: { type: "busy" } } }), get: async () => ({ data: {} }) },
-        app: { log: async (entry) => { logs.push(entry?.body ?? entry); } },
+        app: {
+          log: async (entry) => { logs.push(entry?.body ?? entry); },
+          agents: async () => { if (agentsFail) throw new Error("server away"); return { data: agents ?? [] }; },
+        },
       };
       const { OpencodeGuard } = await import(${JSON.stringify(pluginUrl)});
       const hooks = await OpencodeGuard({ client, directory: ${JSON.stringify(h)} });
+      const agent = ${JSON.stringify(agent ?? null)};
+      if (agent) await hooks["chat.params"]({ sessionID: "ses_a", agent, provider: { id: "x" } }, { options: {} });
       let outcome = "ran";
       try {
         await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_a", callID: "c1" }, { args: { command: ${JSON.stringify(command)} } });
@@ -227,11 +234,32 @@ const runHook = ({ mode, command, config }) => {
     });
     assert.equal(child.status, 0, child.stderr);
     const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
-    return config === undefined ? result.outcome : result;
+    return config === undefined && agents === undefined && !agentsFail ? result.outcome : result;
   } finally {
     rmSync(h, { recursive: true, force: true });
   }
 };
+
+const TESTER = [
+  { permission: "*", pattern: "*", action: "allow" },
+  ...RULES.map(([pattern, action]) => ({ permission: "bash", pattern, action })),
+  { permission: "bash", pattern: "npm test*", action: "allow" },
+];
+test("the hook judges with the session's agent ruleset from opencode", () => {
+  const agents = [{ name: "tester", permission: TESTER }];
+  assert.match(runHook({ mode: "manual", agent: "tester", agents, command: "npm test > /home/dev/.bashrc" }).outcome,
+    /matches an allow rule/, "the agent's own npm test* allow does not launder a redirect");
+  assert.equal(runHook({ mode: "manual", agent: "tester", agents, command: "npm test" }).outcome, "ran");
+  assert.equal(runHook({ mode: "manual", agent: "build", agents, command: "npm test > /home/dev/.bashrc" }).outcome, "ran",
+    "an agent without the allow is asked natively, so the floor stays out of it");
+});
+
+test("when opencode cannot list agents the hook falls back to the global rules and says so", () => {
+  const result = runHook({ mode: "manual", agent: "tester", agentsFail: true, command: "echo x > /home/dev/.bashrc" });
+  assert.match(result.outcome, /matches an allow rule/);
+  assert.ok(result.logs.some((e) => e?.level === "error" && /agent/.test(e?.message ?? "")),
+    `expected an error log about the agent rulesets, got ${JSON.stringify(result.logs)}`);
+});
 
 test("with a broken opencode.json the hook still blocks, and reports the config error", () => {
   const result = runHook({ mode: "manual", command: "echo x > /home/dev/.bashrc", config: "{ not json" });
@@ -251,6 +279,35 @@ test("the hook blocks a laundered write in manual, edits and auto, and stands as
   assert.equal(runHook({ mode: "manual", command: "echo hi" }), "ran");
   assert.equal(runHook({ mode: "manual", command: "sort -o out in" }), "ran",
     "a natively-asked command was approved by a person and runs");
+});
+
+// An agent's own rules (and a project config) are appended to the global ones, last
+// match wins. opencode hands a plugin each agent's merged ruleset; the floor judges
+// with that, and keeps its "allowed but unverifiable" refusal to globally-allowed
+// commands -- an agent's own allow for a writer (tester's npm test) is deliberate.
+test("bashRulesFromRuleset reads opencode's merged agent rulesets, v1 and v2 shapes", () => {
+  const v1 = [
+    { permission: "*", pattern: "*", action: "allow" },
+    { permission: "edit", pattern: "*", action: "deny" },
+    { permission: "bash", pattern: "*", action: "ask" },
+    { permission: "bash", pattern: "npm test*", action: "allow" },
+  ];
+  assert.deepEqual(P.bashRulesFromRuleset(v1), [["*", "allow"], ["*", "ask"], ["npm test*", "allow"]]);
+  const v2 = [{ action: "*", resource: "*", effect: "allow" }, { action: "bash", resource: "ls *", effect: "deny" }];
+  assert.deepEqual(P.bashRulesFromRuleset(v2), [["*", "allow"], ["ls *", "deny"]]);
+  assert.equal(P.bashRulesFromRuleset(undefined), null);
+  assert.equal(P.bashRulesFromRuleset([{ nonsense: true }]), null, "an unrecognised shape is not guessed at");
+});
+
+test("an agent's own allow is judged for writes, but not refused for being a writer", () => {
+  const agent = [["*", "allow"], ["*", "ask"], ["npm test*", "allow"], ["mkdir*", "allow"], ["cat *", "allow"]];
+  const global = [["*", "allow"], ["*", "ask"], ["cat *", "allow"], ["git fetch*", "allow"]];
+  assert.equal(P.launderReason("npm test", agent, global), null, "the agent allows its test runner");
+  assert.equal(P.launderReason("mkdir build", agent, global), null);
+  assert.ok(P.launderReason("npm test > /home/dev/.bashrc", agent, global), "but not a redirect into a file");
+  assert.equal(P.launderReason("npm test > /tmp/opencode/test.log", agent, global), null);
+  assert.ok(P.launderReason("cat a > b", agent, global));
+  assert.ok(P.launderReason("git fetch-pack --exec=x .", global, global), "a global allow must still be verifiable");
 });
 
 test("the bash parser loads, so compound syntax is judged command by command", () => {

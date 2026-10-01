@@ -5,6 +5,23 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.5.0] — 2026-10-01
+
+### Changed
+
+- **The launder floor judges with the session's own agent ruleset.** opencode
+  appends an agent's own permission block (and a project config) after the global
+  rules, last match wins, so a rule only one agent has -- the tester seat's
+  `npm test*` -- was invisible to the floor: `npm test > ~/.bashrc` ran unprompted
+  there. The plugin now records each session's agent from `chat.params` and reads
+  every agent's merged ruleset (opencode defaults, global and project config, the
+  agent's block) from `client.app.agents()`, v1 or v2 rule shape. The "allowed but
+  cannot be verified as a read" refusal still applies only to commands the GLOBAL
+  config allows; an agent's own allow for a writer (a test runner, `git commit`) is
+  deliberate and is judged only for writes it did not ask for. If opencode cannot
+  list the agents, the floor uses the global config and logs an error saying an
+  agent's own rules are not seen.
+
 ## [1.4.0] — 2026-10-01
 
 ### Changed

@@ -71,7 +71,7 @@ import { pathToFileURL } from "node:url";
 import {
   normalizeLevel, normalizeMode, normalizeGlobalMode, resolveSessionMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
   commandUnder, credentialAdvice, siteConfig,
-  strip, commandIsRead, launderReason, bashRulesLoad, parserError, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
+  strip, commandIsRead, launderReason, bashRulesLoad, parserError, bashRulesFromRuleset, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
   agentCapability, dispatchRefusal, staleToolRefusal, sessionIdle,
   nativeToolWritesControlFile, commandWritesControlFile,
@@ -198,6 +198,43 @@ export const OpencodeGuard = async ({ client, directory }) => {
     await reportError("parser-error", `opencode-guard: the bash parser did not load (${parserError}); ` +
       "the launder floor refuses commands with compound syntax until it does");
   }
+  // The launder floor judges with the ruleset the session's agent actually runs under:
+  // opencode merges its defaults, the global and project configs and the agent's own
+  // block, and appends the agent's rules after the global ones (last match wins).
+  // chat.params names a session's agent; client.app.agents() returns each merged
+  // ruleset. Unknown agent or no answer: the global config, and an error says so.
+  const sessionAgents = new Map();
+  const SESSION_AGENTS_CAP = 2000;
+  let agentRules = null;
+  let agentRulesAt = 0;
+  let agentRulesFailed = false;
+  const loadAgentRules = async () => {
+    agentRulesAt = Date.now();
+    try {
+      const response = await client.app.agents({ query: { directory } });
+      const list = response?.data ?? response;
+      if (!Array.isArray(list)) throw new Error("the agent list had an unexpected shape");
+      const map = new Map();
+      for (const agent of list) {
+        const rules = bashRulesFromRuleset(agent?.permission);
+        if (typeof agent?.name === "string" && rules) map.set(agent.name, rules);
+      }
+      agentRules = map;
+      agentRulesFailed = false;
+    } catch (error) {
+      if (!agentRulesFailed) {
+        await reportError("agent-rules-error", `opencode-guard: could not read the agents' permission rulesets (${error?.message ?? error}); ` +
+          "the launder floor is judging with the global config only, so an agent's own allow rules are not seen");
+      }
+      agentRulesFailed = true;
+    }
+  };
+  const rulesFor = async (sessionID) => {
+    const agent = sessionAgents.get(sessionID);
+    if (!agent) return undefined;
+    if (!agentRules?.has(agent) && Date.now() - agentRulesAt > 30_000) await loadAgentRules();
+    return agentRules?.get(agent);
+  };
   const handled = new Set();
   // Denials raised by a DELEGATED child, keyed by the parent session that dispatched
   // it. A child that is refused something just returns a thinner answer; without
@@ -622,6 +659,11 @@ const modeFor = async (sessionID) => {
     // a local coding agent on the same provider keeps its thinking, and cloud calls
     // must never be handed this key.
     "chat.params": async (input, output) => {
+      if (typeof input?.sessionID === "string" && typeof input?.agent === "string") {
+        sessionAgents.delete(input.sessionID);
+        sessionAgents.set(input.sessionID, input.agent);
+        if (sessionAgents.size > SESSION_AGENTS_CAP) sessionAgents.delete(sessionAgents.keys().next().value);
+      }
       const { noThinkProviders } = classifierConfig();
       if (!localNoThinkApplies(input?.agent, input?.provider?.id, noThinkProviders)) return;
       output.options = {
@@ -726,7 +768,7 @@ const modeFor = async (sessionID) => {
       // run unprompted, but its parsed arguments make a read verb write a file or run
       // a program. A glob cannot see inside argv; this can. Commands opencode would
       // ask about are not judged here -- a person approved those.
-      const laundered = launderReason(command);
+      const laundered = launderReason(command, await rulesFor(input?.sessionID));
       if (laundered) {
         log("deny(launder)", command);
         throw new Error(

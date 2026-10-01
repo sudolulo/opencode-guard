@@ -26,9 +26,14 @@ const runRoutedClassifier = ({ busyCleanup = false, failFirst = false } = {}) =>
         request.setEncoding("utf8");
         request.on("data", (chunk) => { text += chunk; });
         request.on("end", () => {
-          calls.push({ path: request.url, body: text ? JSON.parse(text) : {} });
+          const body = text ? JSON.parse(text) : {};
+          calls.push({ path: request.url, body });
           response.writeHead(200, { "content-type": "application/json" });
-          response.end("{}");
+          // The current broker contract: a session's live lease is read back with
+          // /lease/verify, and settlements must carry that broker-minted leaseID.
+          response.end(request.url === "/lease/verify"
+            ? JSON.stringify({ held: true, leaseID: "lease_" + body.sessionID })
+            : "{}");
         });
       });
       await new Promise((resolve) => server.listen(socketPath, resolve));
@@ -137,11 +142,14 @@ test("the routed classifier creates one fixed unpinned agent and reports failure
   const failure = result.calls.find((call) => call.path === "/failure");
   assert.deepEqual(failure.body, {
     sessionID: result.created[0].sessionID,
+    leaseID: "lease_" + result.created[0].sessionID,
     error: "classifier request failed (HTTP 503): provider exploded",
   });
+  // Every settlement carries the broker-minted leaseID: without it the broker refuses
+  // the report and the lease leaks until its idle reaper takes it.
   assert.deepEqual(
-    result.calls.filter((call) => call.path === "/forget").map((call) => call.body.sessionID),
-    result.created.map((created) => created.sessionID),
+    result.calls.filter((call) => call.path === "/forget").map((call) => call.body),
+    result.created.map((created) => ({ sessionID: created.sessionID, leaseID: "lease_" + created.sessionID })),
   );
 });
 
@@ -152,7 +160,7 @@ test("a timed-out classifier is forgotten even when its delete is deferred", () 
   assert.equal(result.statusCount, 1, "the child was observed busy during cleanup");
   assert.equal(result.calls.some((call) => call.path === "/failure"), false, "timeouts do not indict the provider");
   const forgets = result.calls.filter((call) => call.path === "/forget");
-  assert.equal(forgets.at(-1).body.sessionID, result.created[0].sessionID);
+  assert.deepEqual(forgets.at(-1).body, { sessionID: result.created[0].sessionID, leaseID: "lease_" + result.created[0].sessionID });
 });
 
 test("chat.params disables thinking only for fleet-classifier on a listed provider", () => {
@@ -165,7 +173,8 @@ test("chat.params disables thinking only for fleet-classifier on a listed provid
 test("classifier cleanup reaches idle before deleting the disposable session", () => {
   const source = readFileSync(new URL("../plugin.js", import.meta.url), "utf8");
   const start = source.indexOf("if (sessionID) {");
-  const end = source.indexOf('brokerRequest("/forget"', start);
+  const end = source.indexOf('settleClassifierLease("/forget"', start);
+  assert.ok(end > start, "the cleanup ends by settling the lease");
   const cleanup = source.slice(start, end);
   const abort = cleanup.indexOf("client.session.abort");
   const poll = cleanup.indexOf("client.session.status");

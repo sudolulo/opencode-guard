@@ -405,6 +405,29 @@ const modeFor = async (sessionID) => {
     log(`redacted(${count})`, String(output?.title ?? input.tool));
   };
 
+  // Report a failure or settle (forget) the classifier child's lease. The broker
+  // accepts a settlement only with its broker-minted leaseID -- a sessionID alone is
+  // refused ("lease id is required for settlement") -- and the guard did not mint the
+  // lease (the router's chat.message did), so it reads it back with /lease/verify. No
+  // live lease means nothing to settle. A refusal is logged, never swallowed: a silent
+  // catch here leaked every classifier lease until the broker's idle reaper took it.
+  const settleClassifierLease = async (path, sessionID, extra, dir) => {
+    let leaseID = null;
+    try {
+      const held = await brokerRequest("/lease/verify", { sessionID }, { dir });
+      leaseID = held?.held && typeof held.leaseID === "string" ? held.leaseID : null;
+    } catch (error) {
+      log("classifier-lease-verify-failed", `${sessionID} ${error?.message ?? error}`);
+      return;
+    }
+    if (!leaseID) return;
+    try {
+      await brokerRequest(path, { sessionID, leaseID, ...extra }, { dir });
+    } catch (error) {
+      log(`classifier-${path.slice(1)}-refused`, `${sessionID} ${error?.message ?? error}`);
+    }
+  };
+
   // The broker lane: create one ordinary routed classifier child and clean it up.
   // The broker's chat.message hook owns model selection and the child's one lease;
   // the guard owns the child lifecycle and reports against its real session ID.
@@ -498,7 +521,7 @@ const modeFor = async (sessionID) => {
       // Empty/timeout falls back to the safe default without touching provider
       // health.
       if (sessionID && !aborted && !noText) {
-        try { await brokerRequest("/failure", { sessionID, error: detail }, { dir: config?.brokerDir }); } catch {}
+        await settleClassifierLease("/failure", sessionID, { error: detail }, config?.brokerDir);
       }
       return `error:${detail}`;
     } finally {
@@ -534,7 +557,7 @@ const modeFor = async (sessionID) => {
           // not proved it is idle; a later operator cleanup can remove the row safely.
           log("classifier-cleanup-deferred", `${sessionID} ${error?.message ?? error}`);
         }
-        try { await brokerRequest("/forget", { sessionID }, { dir: config?.brokerDir }); } catch {}
+        await settleClassifierLease("/forget", sessionID, {}, config?.brokerDir);
       }
     }
   };

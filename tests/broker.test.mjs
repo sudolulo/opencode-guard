@@ -194,8 +194,12 @@ test("duplicate real-session failure and forget reports do not extend the circui
           }, { dir: brokerDir });
           if (!firstFailure) {
             firstTargetID = lease.target.id;
+            // The router's own report, as the router makes it: with the broker-minted
+            // leaseID, which every settlement call has required since opencode-broker
+            // secured its lease bindings.
             firstFailure = await B.brokerRequest("/failure", {
               sessionID,
+              leaseID: lease.leaseID,
               targetID: firstTargetID,
               error: { statusCode: 503, message: "provider exploded" },
             }, { dir: brokerDir });
@@ -221,6 +225,12 @@ test("duplicate real-session failure and forget reports do not extend the circui
 
     const status = await B.brokerRequest("/status", {}, { dir: brokerDir });
     assert.equal(status.leases[created[0].sessionID], undefined, "the real-session lease is gone");
+    // The successful classification's lease is settled only by the guard's own /forget
+    // (the stub delete above sends no leaseID, so the broker refuses it). The broker
+    // refuses a settlement without the broker-minted leaseID; a guard that sent only the
+    // sessionID leaked every classifier lease until the idle reaper took it.
+    assert.equal(created.length, 2, "the failed classification was retried once");
+    assert.equal(status.leases[created[1].sessionID], undefined, "the guard's own /forget settled the retry's lease");
     assert.equal(Date.parse(status.circuits[firstTargetID].renewsAt), firstFailure.circuitUntil,
       "the guard's duplicate failure report cannot extend the router's circuit");
   } finally {

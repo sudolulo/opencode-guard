@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.5.1] — 2026-10-01
+
+### Fixed
+
+- ☠️ **Every routed classifier lease leaked.** opencode-broker now accepts a
+  `/failure` or `/forget` only with the broker-minted `leaseID` ("lease id is
+  required for settlement"); the guard sent only the session ID and swallowed the
+  refusal in an empty `catch`, so no classifier failure was reported and no
+  classifier lease was settled until the broker's idle reaper took it. The guard
+  now reads the child's live lease back with `/lease/verify` and sends its
+  `leaseID`; a refusal or a failed lookup is logged (`classifier-forget-refused`,
+  `classifier-lease-verify-failed`) instead of swallowed. The real-broker test's
+  router stub sends its `leaseID` as the router does, and the test now also
+  requires the retry's lease -- settled only by the guard -- to be gone.
+
 ## [1.5.0] — 2026-10-01
 
 ### Changed

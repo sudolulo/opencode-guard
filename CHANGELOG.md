@@ -5,6 +5,24 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.6.1] — 2026-10-02
+
+### Fixed
+
+- ☠️ **Value-taking flags were misread as subcommands when detecting unattended
+  runs.** `unattendedFrom` picked the first non-dash token after argv[0] as the
+  subcommand without knowing which flags take a value, so `opencode -m prov/model
+  run`, `opencode --log-level DEBUG run` and `opencode --port 4096 serve` all
+  resolved to attended -- the unsafe direction, because unattended processes are
+  the ones that get strict permission handling. The scan now skips the token
+  after a known value-taking flag (`-m`, `--model`, `--log-level`, `--port`,
+  `--hostname`, `-s`, `--session`, `--agent`, `-p`, `--prompt`, `--cors`,
+  `--mdns-domain`, `--variant`, `--title`, `-f`, `--file`, `--format`, `--dir`,
+  `--attach`) and honours `--` as end of options. One narrow tiebreak: if the
+  value a flag ate is itself a headless subcommand (`opencode -m run`), the
+  scan is ambiguous and prefers unattended. The same parser lives in
+  opencode-ntfy/lib/headless.js and the two flag lists are kept identical.
+
 ## [1.6.0] — 2026-10-01
 
 ### Added

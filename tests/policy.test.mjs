@@ -547,6 +547,39 @@ test("a session counts as unattended when nobody can answer a prompt", () => {
   assert.equal(typeof P.isUnattended, "boolean");
 });
 
+// A value-taking flag written without `=` eats the following token. The old
+// scanner was flag-blind and took that eaten value as the first positional, so
+// `opencode -m prov/model run` resolved to attended -- the unsafe direction.
+test("value-taking flags skip their value when the scanner looks for the subcommand", () => {
+  const cases = [
+    [["opencode"], false, "argv0 only is attended"],
+    [["opencode", "/dir"], false, "a bare path is a project dir, not a subcommand"],
+    [["opencode", "run", "x"], true],
+    [["opencode", "-m", "a/b", "run"], true, "-m consumed a/b, run is the subcommand"],
+    [["opencode", "--model=a/b", "run"], true, "--model=value carries its value"],
+    [["opencode", "--log-level", "DEBUG", "run"], true],
+    [["opencode", "--port", "4096", "serve"], true],
+    [["opencode", "--auto"], true],
+    [["opencode", "-m", "a/b"], false, "no subcommand after the model: still attended"],
+    [["opencode", "--", "run"], true, "`--` ends options; the next token is the subcommand"],
+    [[], true],
+    [["opencode", "--agent", "build", "/dir"], false, "--agent eats build; /dir is just a dir"],
+  ];
+  for (const [tokens, expected, note] of cases) {
+    assert.equal(P.unattendedFrom(tokens), expected, note ?? JSON.stringify(tokens));
+  }
+});
+
+// Strict-direction tiebreak. `opencode -m run` has no model value and consumes
+// `run` as -m's value, which is indistinguishable from a model literally named
+// run. The scan is ambiguous, so prefer the unattended direction.
+test("an ambiguous scan where a headless subcommand sits as a value-flag's value prefers unattended", () => {
+  assert.equal(P.unattendedFrom(["opencode", "-m", "run"]), true);
+  assert.equal(P.unattendedFrom(["opencode", "--model", "serve"]), true);
+  // But a value that is NOT a headless subcommand is not ambiguous: `opencode -m foo` is attended.
+  assert.equal(P.unattendedFrom(["opencode", "-m", "foo"]), false);
+});
+
 test("redaction hides secret values and leaves the structure alone", () => {
   const r = (s) => P.redactSecrets(s);
   const hid = (s) => r(s).count > 0 && !r(s).text.includes("SHOULDNOTAPPEAR");

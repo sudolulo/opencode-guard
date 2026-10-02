@@ -9,19 +9,24 @@ were released privately as opencode-guardrails.
 
 ### Fixed
 
-- ☠️ **Value-taking flags were misread as subcommands when detecting unattended
-  runs.** `unattendedFrom` picked the first non-dash token after argv[0] as the
-  subcommand without knowing which flags take a value, so `opencode -m prov/model
-  run`, `opencode --log-level DEBUG run` and `opencode --port 4096 serve` all
-  resolved to attended -- the unsafe direction, because unattended processes are
-  the ones that get strict permission handling. The scan now skips the token
-  after a known value-taking flag (`-m`, `--model`, `--log-level`, `--port`,
-  `--hostname`, `-s`, `--session`, `--agent`, `-p`, `--prompt`, `--cors`,
-  `--mdns-domain`, `--variant`, `--title`, `-f`, `--file`, `--format`, `--dir`,
-  `--attach`) and honours `--` as end of options. One narrow tiebreak: if the
-  value a flag ate is itself a headless subcommand (`opencode -m run`), the
-  scan is ambiguous and prefers unattended. The same parser lives in
-  opencode-ntfy/lib/headless.js and the two flag lists are kept identical.
+- ☠️ **Flag-aware argv parsing misread unattended runs as attended.**
+  `unattendedFrom` picks whether an opencode process gets strict permission
+  handling, so misreading a headless run as attended is the unsafe direction.
+  The previous scan walked argv looking for the first positional and skipped
+  the value of a known value-taking flag -- but any flag it did not know about
+  (`--replay-limit 5 run`) still hid the subcommand, and a value flag with a
+  POSIX terminator (`opencode -- -x run`) or a model argument before the
+  subcommand (`opencode -m run /dir`) also resolved to attended. The scanner
+  (and its VALUE_FLAGS list) is gone. The rule is now: `--auto` anywhere OR
+  ANY token after argv0 is EXACTLY one of `run`, `serve`, `acp`, `github`,
+  `export`, `import`. It is a strict superset of the old first-positional
+  rule, so no argv that used to resolve "unattended" can resolve "attended"
+  under it, and it is immune to flag-value parsing including undeclared
+  value-taking flags. Its one false positive is a TUI whose argv has a bare
+  token spelled exactly like a headless subcommand (a model named `run`,
+  a session title literally `serve`); for guard that means stricter handling,
+  which is the intended direction. opencode-ntfy keeps a precise parser on
+  purpose because there the cheap error is the opposite one.
 
 ## [1.6.0] — 2026-10-01
 

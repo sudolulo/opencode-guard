@@ -547,37 +547,77 @@ test("a session counts as unattended when nobody can answer a prompt", () => {
   assert.equal(typeof P.isUnattended, "boolean");
 });
 
-// A value-taking flag written without `=` eats the following token. The old
-// scanner was flag-blind and took that eaten value as the first positional, so
-// `opencode -m prov/model run` resolved to attended -- the unsafe direction.
-test("value-taking flags skip their value when the scanner looks for the subcommand", () => {
+// The rule, in full: unattended iff `--auto` appears anywhere OR ANY token
+// after argv0 is EXACTLY one of HEADLESS_COMMANDS. No flag-value parsing. A
+// strict superset of the old "first positional is a headless subcommand"
+// scanner, so no argv that used to resolve "unattended" can resolve "attended"
+// under it (checked by the property test below).
+test("unattendedFrom: a token spelled like a headless subcommand means unattended", () => {
   const cases = [
+    // Argv0 alone, bare paths, lone options: attended.
     [["opencode"], false, "argv0 only is attended"],
     [["opencode", "/dir"], false, "a bare path is a project dir, not a subcommand"],
+    [["opencode", "-s"], false, "a lone flag is still just a TUI"],
+    [["opencode", "--title", "my run"], false, "the value contains 'run' but is not exactly 'run'"],
+    [["opencode", "/home/x/run"], false, "a path whose basename is 'run' is not the subcommand"],
+    [["opencode", "-m", "a/b"], false, "no headless token present"],
+    [["opencode", "-m", "foo"], false, "no headless token present (old tie-break case)"],
+    [["opencode", "--agent", "build", "/dir"], false, "no headless token present"],
+    // Classic headless invocations.
     [["opencode", "run", "x"], true],
-    [["opencode", "-m", "a/b", "run"], true, "-m consumed a/b, run is the subcommand"],
-    [["opencode", "--model=a/b", "run"], true, "--model=value carries its value"],
+    [["opencode", "serve"], true],
+    // --auto always wins.
+    [["opencode", "--auto"], true],
+    [["opencode", "run", "--auto", "hello"], true],
+    // Flag-value forms that worked before: still unattended, now by direct match.
+    [["opencode", "-m", "a/b", "run"], true, "run is a bare token after argv0"],
+    [["opencode", "--model=a/b", "run"], true],
     [["opencode", "--log-level", "DEBUG", "run"], true],
     [["opencode", "--port", "4096", "serve"], true],
-    [["opencode", "--auto"], true],
-    [["opencode", "-m", "a/b"], false, "no subcommand after the model: still attended"],
-    [["opencode", "--", "run"], true, "`--` ends options; the next token is the subcommand"],
+    [["opencode", "--", "run"], true, "`--` is a bare token; `run` is still a bare token after argv0"],
+    // Previously-false-attended regressions: the old flag-aware scanner read
+    // the token after `-m` as the first positional (so `/dir` was treated as
+    // the project dir), and read `--` as ending options so `-x run` had no
+    // headless token in the positional slot.
+    [["opencode", "-m", "run", "/dir"], true, "regression: -m eats run; /dir is the project dir, but run is still a bare token"],
+    [["opencode", "--model", "serve", "x"], true, "regression: --model eats serve, but serve is still a bare token"],
+    [["opencode", "--", "-x", "run"], true, "regression: `--` ends options; `-x` is not a flag, but `run` is still a bare token"],
+    // Undeclared value-taking flag: the old scanner misread the value as the
+    // first positional. The new rule does not care which flags take values.
+    [["opencode", "--replay-limit", "5", "run"], true, "regression: an undeclared value flag no longer hides the subcommand"],
+    // Unknown single-letter flags were already read as valueless, so these
+    // were already unattended; they stay unattended under the new rule.
+    [["opencode", "-c", "run"], true],
+    [["opencode", "--print-logs", "run"], true],
+    // Previously tie-break: `-m run` has no model value but `run` is still a
+    // bare token after argv0, so unattended.
+    [["opencode", "-m", "run"], true],
+    [["opencode", "--model", "serve"], true],
+    // Degenerate inputs resolve to the strict direction.
     [[], true],
-    [["opencode", "--agent", "build", "/dir"], false, "--agent eats build; /dir is just a dir"],
+    [["opencode", "run", "hello"], true],
+    [["opencode", "projects/app"], false],
   ];
   for (const [tokens, expected, note] of cases) {
     assert.equal(P.unattendedFrom(tokens), expected, note ?? JSON.stringify(tokens));
   }
-});
 
-// Strict-direction tiebreak. `opencode -m run` has no model value and consumes
-// `run` as -m's value, which is indistinguishable from a model literally named
-// run. The scan is ambiguous, so prefer the unattended direction.
-test("an ambiguous scan where a headless subcommand sits as a value-flag's value prefers unattended", () => {
-  assert.equal(P.unattendedFrom(["opencode", "-m", "run"]), true);
-  assert.equal(P.unattendedFrom(["opencode", "--model", "serve"]), true);
-  // But a value that is NOT a headless subcommand is not ambiguous: `opencode -m foo` is attended.
-  assert.equal(P.unattendedFrom(["opencode", "-m", "foo"]), false);
+  // Property: the new rule is a strict superset of the old first-positional
+  // rule. Every row in the table above that the old rule called unattended
+  // must still be unattended under the new rule. (The reverse is intentionally
+  // NOT required: the new rule is deliberately stricter.)
+  const oldRule = (t) => {
+    if (!Array.isArray(t) || !t.length) return true;
+    if (t.includes("--auto")) return true;
+    const p = t.slice(1).find((x) => !x.startsWith("-"));
+    return ["run", "serve", "acp", "github", "export", "import"].includes(p);
+  };
+  for (const [tokens] of cases) {
+    if (oldRule(tokens)) {
+      assert.equal(P.unattendedFrom(tokens), true,
+        `new rule must call ${JSON.stringify(tokens)} unattended (old rule did)`);
+    }
+  }
 });
 
 test("redaction hides secret values and leaves the structure alone", () => {

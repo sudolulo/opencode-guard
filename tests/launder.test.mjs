@@ -198,7 +198,7 @@ test("the strict read checks also tighten auto-mode read classification", () => 
 
 // Through the real hook, in a subprocess with a throwaway HOME: the plugin reads its
 // files at import.
-const runHook = ({ mode, command, config, agent, agents, agentsFail }) => {
+const runHook = ({ mode, command, config, agent, agents, agentsFail, events }) => {
   const h = mkdtempSync(join(tmpdir(), "guard-launder-hook-"));
   try {
     mkdirSync(join(h, ".config/opencode"), { recursive: true });
@@ -223,6 +223,7 @@ const runHook = ({ mode, command, config, agent, agents, agentsFail }) => {
       const hooks = await OpencodeGuard({ client, directory: ${JSON.stringify(h)} });
       const agent = ${JSON.stringify(agent ?? null)};
       if (agent) await hooks["chat.params"]({ sessionID: "ses_a", agent, provider: { id: "x" } }, { options: {} });
+      for (const event of ${JSON.stringify(events ?? [])}) await hooks.event({ event });
       let outcome = "ran";
       try {
         await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_a", callID: "c1" }, { args: { command: ${JSON.stringify(command)} } });
@@ -234,11 +235,30 @@ const runHook = ({ mode, command, config, agent, agents, agentsFail }) => {
     });
     assert.equal(child.status, 0, child.stderr);
     const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
-    return config === undefined && agents === undefined && !agentsFail ? result.outcome : result;
+    return config === undefined && agents === undefined && !agentsFail && !events ? result.outcome : result;
   } finally {
     rmSync(h, { recursive: true, force: true });
   }
 };
+
+test("a config deny rule holds in god mode, where an Always approval could otherwise override it", () => {
+  assert.match(runHook({ mode: "god", command: "rm -rf /etc" }), /matches a deny rule/);
+  assert.match(runHook({ mode: "god", command: "snip rm -rf /etc" }), /matches a deny rule/);
+  assert.equal(runHook({ mode: "god", command: "echo x > /home/dev/.bashrc" }), "ran", "god still lifts the launder floor");
+});
+
+test("an Always reply that saved a blanket pattern is reported as an error", () => {
+  const asked = { type: "permission.asked", properties: { id: "per_1", sessionID: "ses_a", permission: "bash",
+    patterns: ["snip git push origin x"], always: ["snip *"], metadata: { command: "snip git push origin x" } } };
+  const replied = { type: "permission.replied", properties: { sessionID: "ses_a", requestID: "per_1", reply: "always" } };
+  const result = runHook({ mode: "manual", command: "echo hi", events: [asked, replied] });
+  assert.ok(result.logs.some((e) => e?.level === "error" && /snip \*/.test(e?.message ?? "") && /restart/i.test(e?.message ?? "")),
+    `expected an error naming the blanket approval, got ${JSON.stringify(result.logs)}`);
+  const narrow = { ...asked, properties: { ...asked.properties, id: "per_2", always: ["git push *"] } };
+  const narrowReply = { ...replied, properties: { ...replied.properties, requestID: "per_2" } };
+  const quiet = runHook({ mode: "manual", command: "echo hi", events: [narrow, narrowReply] });
+  assert.equal(quiet.logs.some((e) => /Always/.test(e?.message ?? "")), false);
+});
 
 const TESTER = [
   { permission: "*", pattern: "*", action: "allow" },
@@ -308,6 +328,21 @@ test("an agent's own allow is judged for writes, but not refused for being a wri
   assert.equal(P.launderReason("npm test > /tmp/opencode/test.log", agent, global), null);
   assert.ok(P.launderReason("cat a > b", agent, global));
   assert.ok(P.launderReason("git fetch-pack --exec=x .", global, global), "a global allow must still be verifiable");
+});
+
+test("configDenyReason applies the config's deny rules to every command node", () => {
+  const rules = [["*", "ask"], ["rm -rf /*", "deny"], ["snip rm -rf /*", "deny"], ["ls *", "allow"]];
+  assert.ok(P.configDenyReason("rm -rf /etc", rules));
+  assert.ok(P.configDenyReason("snip rm -rf /etc", rules));
+  assert.ok(P.configDenyReason("for x in a; do rm -rf /etc; done", rules));
+  assert.ok(P.configDenyReason("ls && (rm -rf /etc)", rules));
+  assert.equal(P.configDenyReason("ls -la", rules), null);
+  assert.equal(P.configDenyReason("git push origin x", rules), null, "ask is not deny");
+});
+
+test("blanketAlwaysPattern spots the approvals that cover far more than one command", () => {
+  for (const p of ["*", "snip *", "rtk *", "env *", "sudo *"]) assert.equal(P.blanketAlwaysPattern(p), true, p);
+  for (const p of ["git push *", "npm run *", "snip git *", "ls *", ""]) assert.equal(P.blanketAlwaysPattern(p), false, p);
 });
 
 test("the bash parser loads, so compound syntax is judged command by command", () => {

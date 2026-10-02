@@ -71,7 +71,7 @@ import { pathToFileURL } from "node:url";
 import {
   normalizeLevel, normalizeMode, normalizeGlobalMode, resolveSessionMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
   commandUnder, credentialAdvice, siteConfig,
-  strip, commandIsRead, launderReason, bashRulesLoad, parserError, bashRulesFromRuleset, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
+  strip, commandIsRead, launderReason, bashRulesLoad, parserError, bashRulesFromRuleset, configDenyReason, blanketAlwaysPattern, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
   agentCapability, dispatchRefusal, staleToolRefusal, sessionIdle,
   nativeToolWritesControlFile, commandWritesControlFile,
@@ -203,6 +203,8 @@ export const OpencodeGuard = async ({ client, directory }) => {
   // block, and appends the agent's rules after the global ones (last match wins).
   // chat.params names a session's agent; client.app.agents() returns each merged
   // ruleset. Unknown agent or no answer: the global config, and an error says so.
+  // permission.asked id -> the `always` patterns an "Always" reply would save.
+  const alwaysPatterns = new Map();
   const sessionAgents = new Map();
   const SESSION_AGENTS_CAP = 2000;
   let agentRules = null;
@@ -754,6 +756,23 @@ const modeFor = async (sessionID) => {
       // per-session file says god -- `opencode run --session <id>` re-enters TUI
       // sessions headless, so file provenance is not the same thing as a person
       // present.
+      // The config's DENY rules, re-applied here -- above the god bypass, because they are
+      // the floor god is documented to keep. opencode checks its rules and then the run's
+      // "Always" approvals, last match wins: one "Always" that saved `snip *` overrides
+      // every deny rule (opencode's arity table does not know the snip wrapper), and a
+      // plugin cannot see or revoke those approvals. A deny verdict needs no person to ask,
+      // so enforcing it here changes nothing that was meant to run.
+      if (command) {
+        const denied = configDenyReason(command, await rulesFor(input?.sessionID));
+        if (denied) {
+          log("deny(config)", command);
+          throw new Error(
+            `[opencode-guard] blocked: \`${denied.segment}\` matches a deny rule in the opencode permission config. ` +
+            `Deny rules hold in every mode and over any "Always" approval. Do not rephrase to evade this; ask the user.`,
+          );
+        }
+      }
+
       if (!isUnattended && (await modeFor(input.sessionID)) === "god") { log("allow(god)", command ?? input?.tool); return; }
 
       // The guard's own switches (lib/policy.js, "The guard's own switches") are set
@@ -945,6 +964,27 @@ const modeFor = async (sessionID) => {
         }
       } catch (error) {
         log("loop-guard-error", error?.message ?? error);
+      }
+      // An "Always" reply saves the request's `always` patterns for the rest of the run.
+      // When one of them is blanket (`snip *`: opencode's arity table does not know the
+      // snip wrapper), every later command it covers runs unasked. Deny rules still hold
+      // (enforced above); everything else does not, and only a restart revokes it.
+      if (event?.type === "permission.asked" && event.properties?.id && Array.isArray(event.properties?.always)) {
+        alwaysPatterns.delete(event.properties.id);
+        alwaysPatterns.set(event.properties.id, event.properties.always);
+        if (alwaysPatterns.size > 500) alwaysPatterns.delete(alwaysPatterns.keys().next().value);
+      }
+      if (event?.type === "permission.replied") {
+        const id = event.properties?.requestID;
+        const patterns = alwaysPatterns.get(id) ?? [];
+        alwaysPatterns.delete(id);
+        const blanket = event.properties?.reply === "always" ? patterns.filter(blanketAlwaysPattern) : [];
+        if (blanket.length) {
+          await reportError("always-blanket", `opencode-guard: an "Always" approval saved \`${blanket.join("`, `")}\`, ` +
+            "which approves every matching command for the rest of this opencode run, not just the one shown. " +
+            "Deny rules still hold. Restart opencode to revoke it, and answer \"once\" on snip-prefixed prompts.");
+        }
+        return;
       }
       if (event?.type !== "permission.asked") return;
       // In an unattended session the reply has already been made by the time this

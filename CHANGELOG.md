@@ -5,6 +5,22 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [1.6.0] — 2026-10-01
+
+### Added
+
+- ☠️ **Deny rules hold over "Always" approvals.** opencode checks its permission
+  rules and then the run's "Always" approvals, last match wins, and its arity table
+  does not know the `snip` wrapper: one "Always" on any snip-prefixed prompt saved
+  `snip *`, which approved every later command for the rest of the run -- including
+  everything the config denies (`rm -rf /*`, `mkfs`, `git push --force`). A plugin
+  cannot see or revoke those approvals, so the guard now re-applies the config's
+  deny rules itself (the session agent's merged ruleset when known), to every
+  command node, in every mode including god -- the floor god is documented to keep.
+- **A blanket "Always" is reported.** When an "Always" reply saves `*` or a bare
+  wrapper (`snip *`, `rtk *`, `env *`, ...), the plugin logs an error naming it and
+  saying that only a restart revokes it.
+
 ## [1.5.1] — 2026-10-01
 
 ### Fixed

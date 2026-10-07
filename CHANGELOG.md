@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions before 1.0.0
 were released privately as opencode-guardrails.
 
+## [Unreleased]
+
+### Added
+
+- `docs/STATE.md`: the permission-mode files and resolution rules as a contract for other products (first consumer: opencode-peers).
+
 ## [1.6.1] — 2026-10-02
 
 ### Fixed

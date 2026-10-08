@@ -7,9 +7,22 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-10-08
+
 ### Added
 
 - `docs/STATE.md`: the permission-mode files and resolution rules as a contract for other products (first consumer: opencode-peers).
+- Tree rules for agent teams, enforced in `tool.execute.before` above the god bypass. A session or classification lookup that cannot be completed denies the call and names the rule.
+  - G1: `task` with `task_id` must name an existing child of the calling session. A sibling, the caller's lead, another root's session, the caller itself and a nonexistent id are refused (opencode resumes any session id, and silently starts a fresh child for one that does not exist).
+  - G2: `task` with `background: true` is allowed only from an attended root session, and never together with `task_id`.
+  - G4: a session in an agent team (a background task child of a root, or anything below one) cannot call `workflow_run`, `peer_*`, `schedule_*`, `bg_watch`, `bg_unwatch`, or a `bg_*` tool with `all: true`.
+  - Teammates are recognised by the `task` part that created them (`state.input.background`), indexed from `message.part.updated` events, with a paged read of the root's history when the index has no entry. A foreground task promoted to the background is not a teammate.
+  - G4 fails closed: a child of a root with no creating `task` part in the root's history (for example an SDK-created opencode-agent-workflows workflow child) is treated as possibly in a team, and it and everything below it are refused the tools above, with a refusal that says retrying will not help. This is deliberate, because a teammate's creating part can disappear from the root's history (a revert removes it). Classification is decided by the session just below the root on the caller's path, so a workflow child started from a foreground subagent is classified by that subagent's part and keeps these tools. Behaviour change: a workflow step started directly from a root that calls one of these tools is now refused.
+  - Level `off` skips G1, G2 and G4, like the other pre-run checks; the teammate index is still fed at every level.
+
+### Changed
+
+- G3: a session without its own mode file now runs under the stricter of its immediate parent's mode (the old rule) and the mode of the nearest ancestor that has a mode file, each falling back to the global mode, with an inherited `god` reading `auto`. This only tightens: a direct child resolves as before, and a deeper session no longer runs under a global mode looser than one set on its root. A session whose ancestry cannot be read is denied its tool calls, naming G3, and its permission prompts are left to the person, instead of falling to the global mode.
 
 ## [1.6.1] — 2026-10-02
 

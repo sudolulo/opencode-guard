@@ -720,6 +720,15 @@ const modeFor = async (sessionID) => {
 
     "tool.execute.before": async (input, output) => {
       const command = commandUnder(input?.tool, output?.args);
+      let mode;
+      // Mode resolution can walk a subagent's ancestry and read each ancestor's
+      // mode file. Keep one answer for this tool call, but do not retain a failed
+      // lookup: G3 must still throw rather than turn its denial into a mode value.
+      const currentMode = async () => {
+        if (mode !== undefined) return mode;
+        mode = await modeFor(input?.sessionID);
+        return mode;
+      };
 
       // WARNING: Guarding only `bash` is a hole the moment a pty or background-shell
       // plugin is installed: `pty_spawn` runs an executable with its own argv and
@@ -808,7 +817,7 @@ const modeFor = async (sessionID) => {
         }
       }
 
-      if (!isUnattended && (await modeFor(input.sessionID)) === "god") { log("allow(god)", command ?? input?.tool); return; }
+      if (!isUnattended && (await currentMode()) === "god") { log("allow(god)", command ?? input?.tool); return; }
 
       // The guard's own switches (lib/policy.js, "The guard's own switches") are set
       // by a person, not from a tool call.
@@ -820,7 +829,7 @@ const modeFor = async (sessionID) => {
       // Native read/glob/grep calls never produce a shell command for the guard
       // below. Check their actual path arguments before the tool resolves a glob.
       if (nativeCredentialGuardBlocks({
-        level: lvl, mode: await modeFor(input?.sessionID), unattended: isUnattended,
+        level: lvl, mode: await currentMode(), unattended: isUnattended,
         tool: input?.tool, args: output?.args, directory,
       })) {
         log("deny(credential)", input?.tool);
@@ -909,14 +918,14 @@ const modeFor = async (sessionID) => {
       // without asking anyone? So it runs exactly where nothing will be asked --
       // an unattended session, or auto mode. Manual and edits never reach the
       // model at all: there is a person, and opencode will ask them.
-      const mode = await modeFor(input.sessionID);
-      if (!isUnattended && !classifierDecides(mode)) return;
+      const resolvedMode = await currentMode();
+      if (!isUnattended && !classifierDecides(resolvedMode)) return;
       // Named in every denial below. A mode change is invisible to the agent,
       // so a command that ran a minute ago and is refused now reads as the
       // classifier being nondeterministic -- when what actually changed is the
       // mode. Saying which state made the decision is what lets the agent tell
       // "approval lapsed" from "verdict changed".
-      const state = isUnattended ? "unattended session" : `mode: ${mode}`;
+      const state = isUnattended ? "unattended session" : `mode: ${resolvedMode}`;
 
       if (commandIsRead(command)) { log("allow(read)", command); return; }
       // Privacy profiles must not have command text shipped to a cloud classifier,

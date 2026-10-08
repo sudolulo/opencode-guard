@@ -8,12 +8,13 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // sessions: id -> parentID (null for a root). messages: root id -> its messages in
 // the server's { info, parts } shape (one page, no cursor). modes: per-session mode
 // files. steps, in order: { event } feeds the event hook; { permission, sessionID }
 // raises permission.asked; { tool, sessionID, args } calls tool.execute.before.
-const run = ({ sessions = {}, messages = {}, modes = {}, globalMode, level, getFails = false, steps }) => {
+const run = ({ sessions = {}, messages = {}, modes = {}, globalMode, level, getFails = false, countModeFileReads = false, steps }) => {
   const home = mkdtempSync(join(tmpdir(), "guard-tree-"));
   try {
     mkdirSync(join(home, ".config/opencode"), { recursive: true });
@@ -22,6 +23,22 @@ const run = ({ sessions = {}, messages = {}, modes = {}, globalMode, level, getF
     if (level) writeFileSync(join(home, ".config/opencode/autoclass"), `${level}\n`);
     for (const [id, mode] of Object.entries(modes)) {
       writeFileSync(join(home, ".local/share/opencode/modes", id), `${mode}\n`);
+    }
+    const counter = join(home, "mode-read-counter.mjs");
+    if (countModeFileReads) {
+      writeFileSync(counter, `
+        import fs from "node:fs";
+        import { syncBuiltinESMExports } from "node:module";
+        const originalReadFileSync = fs.readFileSync;
+        globalThis.modeFileReads = 0;
+        fs.readFileSync = function (path, ...args) {
+          if (typeof path === "string" && path.startsWith(process.env.HOME + "/.local/share/opencode/modes/")) {
+            globalThis.modeFileReads += 1;
+          }
+          return originalReadFileSync.call(this, path, ...args);
+        };
+        syncBuiltinESMExports();
+      `);
     }
     const pluginUrl = new URL("../plugin.js", import.meta.url).href;
     const script = `
@@ -72,9 +89,12 @@ const run = ({ sessions = {}, messages = {}, modes = {}, globalMode, level, getF
           outcomes.push("ran");
         } catch (error) { outcomes.push(String(error?.message ?? error)); }
       }
-      console.log(JSON.stringify({ outcomes, gets, pages, replies }));
+      console.log(JSON.stringify({ outcomes, gets, pages, replies, modeFileReads: globalThis.modeFileReads }));
     `;
-    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    const args = countModeFileReads
+      ? ["--import", pathToFileURL(counter).href, "--input-type=module", "-e", script]
+      : ["--input-type=module", "-e", script];
+    const child = spawnSync(process.execPath, args, {
       env: { ...process.env, HOME: home, OPENCODE_GUARD_CONFIG: "" }, encoding: "utf8", timeout: 20_000,
     });
     assert.equal(child.status, 0, child.stderr || child.error?.message);
@@ -107,11 +127,29 @@ test("G3: a session with its own mode file looks nothing up", () => {
   assert.deepEqual(result.gets, []);
 });
 
+test("G3: one subagent tool call walks inherited mode files once", () => {
+  const result = run({
+    sessions: CHAIN,
+    modes: { ses_root: "auto" },
+    countModeFileReads: true,
+    steps: [{ tool: "bash", sessionID: "ses_leaf", args: { command: "echo hello" } }],
+  });
+  assert.equal(result.modeFileReads, 4,
+    "the leaf, its parent twice (parent and nearest), and root are read once for one ancestry walk");
+});
+
 test("G3: an ancestry that cannot be read denies the call, naming the rule", () => {
   const result = run({ sessions: CHAIN, getFails: true,
     steps: [{ tool: "read", sessionID: "ses_leaf", args: { filePath: "/work/a" } }] });
   assert.match(result.outcomes[0],
     /^\[opencode-guard\] denied \(G3, inherited permission mode\): the guard could not check this rule because a session lookup failed \(reading session ses_leaf failed: server away\)/);
+});
+
+test("G3: a failed lazy mode lookup still denies a subagent tool call", () => {
+  const result = run({ sessions: CHAIN, getFails: true,
+    steps: [{ tool: "bash", sessionID: "ses_leaf", args: { command: "echo hello" } }] });
+  assert.match(result.outcomes[0],
+    /^\[opencode-guard\] denied \(G3, inherited permission mode\): the guard could not check this rule because a session lookup failed/);
 });
 
 test("G3: in the permission handler an unresolvable mode leaves the prompt with the person", () => {

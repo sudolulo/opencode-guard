@@ -25,6 +25,9 @@ const run = ({ status, level } = {}) => {
             if (status === "error") return { error: { name: "Unknown" }, response: { status: 500 } };
             return { data: status };
           },
+          // The real client always has session.get. ses_a has no mode file, so G3
+          // reads its ancestry; here it is a root.
+          get: async () => ({ data: {} }),
         },
         app: { log: async () => {} },
       };

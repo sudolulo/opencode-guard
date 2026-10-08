@@ -211,3 +211,14 @@ test("modeFor is declared inside the factory, below infoFor", () => {
   assert.ok(infoFor > factory, "infoFor must stay inside the factory -- it needs v2Client");
   assert.ok(modeFor > infoFor, "modeFor must be declared after infoFor, inside the factory");
 });
+// createSessionTree closes over the PluginInput client, exactly like infoFor, so it
+// must be built inside the factory, and modeFor walks the ancestry through it.
+test("the session tree is created inside the factory, above modeFor", () => {
+  const source = readFileSync(new URL("../plugin.js", import.meta.url), "utf8");
+  const factory = source.indexOf("export const OpencodeGuard");
+  const tree = source.indexOf("const sessionTree = createSessionTree(");
+  const modeFor = source.indexOf("const modeFor =");
+  assert.ok(factory >= 0 && tree >= 0 && modeFor >= 0, "all three declarations must exist");
+  assert.ok(tree > factory, "sessionTree must be built inside the factory");
+  assert.ok(modeFor > tree, "modeFor must be declared after sessionTree");
+});

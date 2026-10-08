@@ -69,7 +69,7 @@ import { pathToFileURL } from "node:url";
 // resolves against this file's REAL path -- so a bare-file symlink into
 // ~/.config/opencode/plugin/ resolves back into this checkout.
 import {
-  normalizeLevel, normalizeMode, normalizeGlobalMode, resolveSessionMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
+  normalizeLevel, normalizeMode, normalizeGlobalMode, resolveTreeMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
   commandUnder, credentialAdvice, siteConfig,
   strip, commandIsRead, launderReason, bashRulesLoad, parserError, bashRulesFromRuleset, configDenyReason, blanketAlwaysPattern, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
@@ -81,6 +81,7 @@ import { classifierConfig, classifierRoute, classifyDirect, verdictFromText } fr
 import { createLoopGuard, createLoopGuardHook, loopGuardOptions } from "./lib/loop-guard.js";
 import { createNotifier } from "./lib/notify.js";
 import { loadSafetyNet, safetyNetVerdict } from "./lib/safety-net.js";
+import { createSessionTree, treeLookupDenial } from "./lib/tree.js";
 
 // Server plugins receive the legacy SDK client. The matching V2 client below
 // keeps its embedded-app fetch transport while generating V2 request bodies.
@@ -332,12 +333,19 @@ const routeFor = async (sessionID) => {
 // the global default -- measured as `manual`, the most restrictive mode. That made
 // every subagent permission a prompt for the operator (the manual-mode return in
 // the permission handler logs nothing, so it left no trace) and skipped the
-// classifier entirely for a child's bash. A child now tracks its parent, capped
-// below god by normalizeGlobalMode. The parent is read through the
-// same cached lookup profileFor already uses, so the SDK is consulted once per
-// session and only when the session has no mode file of its own.
-// Ceiling: one level, matching resolveProfileFor. A grandchild resolves through
-// its own parent, not the root -- fine while only the root is ever set by hand.
+// classifier entirely for a child's bash. A child now inherits, capped below god
+// by normalizeGlobalMode.
+// G3 (agent teams, 1.7.0): a session with no file of its own runs under the
+// STRICTER of (a) the one-level answer -- its immediate parent's file, else the
+// global mode -- and (b) the nearest ancestor that has a file, else the global
+// mode (resolveTreeMode in lib/policy.js). (a) alone let a grandchild of a root
+// set to manual run under a looser global mode. The ancestry comes from
+// sessionTree (lib/tree.js): the legacy client's session.get, each parent link
+// cached for the life of the process because parentID never changes. An ancestry
+// that cannot be read THROWS a denial naming G3 instead of falling to the global
+// mode, which may be looser than every ancestor.
+// sessionTree closes over the PluginInput client, so it is built in the factory.
+const sessionTree = createSessionTree({ client, directory });
 // ☠️ modeFor MUST stay inside the factory, below infoFor -- infoFor closes over
 // v2Client, which closes over the PluginInput client, so neither can live at
 // module scope. Declared above the factory (0.4.8) it threw "infoFor is not
@@ -348,8 +356,18 @@ const routeFor = async (sessionID) => {
 const modeFor = async (sessionID) => {
   const own = sessionMode(sessionID);
   if (own) return own;
-  const parent = sessionMode((await infoFor(sessionID))?.parentID);
-  return resolveSessionMode({ own, parent, fallback: globalMode() });
+  // No session id means no ancestry to inherit from: the global mode, as before 1.7.0.
+  if (!sessionID) return globalMode();
+  let chain;
+  try {
+    chain = await sessionTree.ancestry(sessionID);
+  } catch (error) {
+    log("deny(G3/ancestry)", `${sessionID}: ${error?.message ?? error}`);
+    throw new Error(treeLookupDenial("G3", error));
+  }
+  const parent = chain.length > 1 ? sessionMode(chain[1]) : null;
+  const nearest = chain.slice(1).map((id) => sessionMode(id)).find(Boolean) ?? null;
+  return resolveTreeMode({ own, parent, nearest, fallback: globalMode() });
 };
 
   // Sterile-repeat loop guard (lib/loop-guard.js). The parent comes from the same
@@ -997,7 +1015,16 @@ const modeFor = async (sessionID) => {
       // and is stale here, the same way it was stale about `requestID`.
       const permission = p?.permission;
       if (!permission || !p?.id) return;
-      const currentMode = await modeFor(p.sessionID);
+      let currentMode;
+      try {
+        currentMode = await modeFor(p.sessionID);
+      } catch (error) {
+        // G3 could not resolve an inherited mode (modeFor logged why). Approving or
+        // rejecting would be a guess, so the prompt stays with the person, exactly
+        // as in manual mode.
+        log("prompt(G3/unresolved)", `${p.sessionID}: ${error?.message ?? error}`);
+        return;
+      }
       if (currentMode === "manual") return;
       // A DELEGATED child is one whose mode was INHERITED rather than held: no mode
       // file of its own, but a parent. If a mode was set on the child itself it

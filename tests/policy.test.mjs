@@ -705,6 +705,60 @@ test("a delegated child tracks its parent's mode instead of the global default",
     "a session with no parent still falls to the global default");
 });
 
+test("G3: the spec's table rows for a session with no mode file of its own", () => {
+  // Spec section 4, G3. parent = the immediate parent's file, nearest = the nearest
+  // ancestor's file (here the root's), fallback = the global mode.
+  assert.equal(P.resolveTreeMode({ own: null, parent: null, nearest: "auto", fallback: "manual" }), "manual",
+    "root auto, intermediate none, global manual: manual, as before");
+  assert.equal(P.resolveTreeMode({ own: null, parent: null, nearest: "manual", fallback: "auto" }), "manual",
+    "root manual, intermediate none, global auto: was auto, now manual");
+  for (const global of ["manual", "edits", "auto"]) {
+    assert.equal(P.resolveTreeMode({ own: null, parent: null, nearest: "god", fallback: global }), global,
+      `root god, intermediate none, global ${global}: the stricter of the global mode and auto`);
+  }
+  assert.equal(P.resolveTreeMode({ own: null, parent: null, nearest: "god", fallback: "god" }), "auto",
+    "a hand-written global god reads auto as well");
+  for (const x of ["manual", "edits", "auto"]) {
+    for (const global of ["manual", "edits", "auto"]) {
+      assert.equal(P.resolveTreeMode({ own: null, parent: x, nearest: x, fallback: global }), x,
+        `intermediate file ${x}, global ${global}: the intermediate file is parent and nearest ancestor`);
+    }
+  }
+  assert.equal(P.resolveTreeMode({ own: null, parent: "god", nearest: "god", fallback: "manual" }), "auto",
+    "an inherited god reads auto");
+  for (const own of ["manual", "edits", "auto", "god"]) {
+    assert.equal(P.resolveTreeMode({ own, parent: "manual", nearest: "manual", fallback: "manual" }), own,
+      `own file ${own} wins`);
+  }
+});
+
+test("G3: a direct child resolves as before, and no session ever resolves looser than before", () => {
+  const MODES = ["manual", "edits", "auto", "god", null];
+  const GLOBALS = ["manual", "edits", "auto"];
+  const rank = { manual: 0, edits: 1, auto: 2, god: 3 };
+  for (const global of GLOBALS) {
+    for (const parent of MODES) {
+      const before = P.resolveSessionMode({ own: null, parent, fallback: global });
+      assert.equal(P.resolveTreeMode({ own: null, parent, nearest: parent, fallback: global }), before,
+        `direct child: parent ${parent}, global ${global}`);
+      for (const nearest of MODES) {
+        const g3 = P.resolveTreeMode({ own: null, parent, nearest, fallback: global });
+        assert.ok(rank[g3] <= rank[before],
+          `parent ${parent}, nearest ${nearest}, global ${global}: ${g3} is looser than ${before}`);
+      }
+    }
+  }
+});
+
+test("stricterMode ranks manual < edits < auto < god and reads junk as manual", () => {
+  assert.equal(P.stricterMode("auto", "edits"), "edits");
+  assert.equal(P.stricterMode("edits", "auto"), "edits");
+  assert.equal(P.stricterMode("god", "auto"), "auto");
+  assert.equal(P.stricterMode("manual", "god"), "manual");
+  assert.equal(P.stricterMode("AUTO\n", "auto"), "auto");
+  assert.equal(P.stricterMode("nonsense", "auto"), "manual");
+});
+
 // D1 dispatch gate. agentCapability caches by dir+agent, so every case below uses
 // its own agent name -- reusing one would read a cached verdict rather than the
 // file just written.

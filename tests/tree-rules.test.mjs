@@ -120,3 +120,85 @@ test("G3: in the permission handler an unresolvable mode leaves the prompt with 
   assert.deepEqual(result.outcomes, ["asked"], "the event hook did not throw");
   assert.deepEqual(result.replies, [], "neither approved nor rejected: either answer would be a guess");
 });
+// ---- G1, G2 and G4 through the hook.
+
+// ses_mate: a teammate of ses_root; ses_helper: its helper; ses_fg: a foreground
+// child of ses_root; ses_other: another root with its own child.
+const TEAM = {
+  ses_root: null, ses_mate: "ses_root", ses_helper: "ses_mate", ses_fg: "ses_root",
+  ses_other: null, ses_otherkid: "ses_other",
+};
+const taskPartEvent = (n, root, child, { input = {}, metadata = {} } = {}) => ({
+  type: "message.part.updated",
+  properties: { sessionID: root, time: n, part: {
+    id: `prt_${String(n).padStart(4, "0")}`, sessionID: root, messageID: `msg_${String(n).padStart(4, "0")}`,
+    type: "tool", tool: "task", callID: `call_${n}`,
+    state: {
+      status: "running",
+      input: { description: "d", prompt: "p", subagent_type: "build", ...input },
+      metadata: { sessionId: child, ...metadata },
+      time: { start: n },
+    },
+  } },
+});
+const spawnArgs = (extra = {}) => ({ description: "d", prompt: "p", subagent_type: "build", ...extra });
+
+test("G1 holds in god mode: a subagent cannot resume its sibling", () => {
+  const result = run({ sessions: TEAM, modes: { ses_mate: "god", ses_root: "god" }, steps: [
+    { tool: "task", sessionID: "ses_mate", args: spawnArgs({ task_id: "ses_fg" }) },
+    { tool: "task", sessionID: "ses_root", args: spawnArgs({ task_id: "ses_fg" }) },
+    { tool: "task", sessionID: "ses_root", args: spawnArgs({ task_id: "ses_otherkid" }) },
+  ] });
+  assert.match(result.outcomes[0],
+    /^\[opencode-guard\] denied \(G1, resume only your own child\): task_id ses_fg is not a child of this session/);
+  assert.equal(result.outcomes[1], "ran", "the lead resumes its own child");
+  assert.match(result.outcomes[2], /\(its parent is ses_other\)/);
+});
+
+test("G2 through the hook: an attended root may start a background task, a subagent may not", () => {
+  const result = run({ sessions: TEAM, modes: { ses_root: "auto", ses_fg: "auto" }, steps: [
+    { tool: "task", sessionID: "ses_root", args: spawnArgs({ background: true }) },
+    { tool: "task", sessionID: "ses_fg", args: spawnArgs({ background: true }) },
+  ] });
+  assert.equal(result.outcomes[0], "ran");
+  assert.match(result.outcomes[1], /^\[opencode-guard\] denied \(G2, background teammates only from an attended root\)/);
+});
+
+test("G4 through the hook: an indexed teammate is refused workflow_run, and nothing reads history", () => {
+  const result = run({ sessions: TEAM, modes: { ses_mate: "auto", ses_helper: "auto" }, steps: [
+    { event: taskPartEvent(2, "ses_root", "ses_mate", { input: { background: true } }) },
+    { tool: "workflow_run", sessionID: "ses_mate", args: { name: "review-panel" } },
+    { tool: "bg_list", sessionID: "ses_helper", args: { all: true } },
+    { tool: "read", sessionID: "ses_mate", args: { filePath: "/work/a" } },
+  ] });
+  assert.match(result.outcomes[0], /^\[opencode-guard\] denied \(G4, tools closed to agent teams\): `workflow_run`/);
+  assert.match(result.outcomes[1], /`bg_list with all: true`/);
+  assert.equal(result.outcomes[2], "ran");
+  assert.deepEqual(result.pages, []);
+});
+
+test("G4 through the hook: a promoted task's child keeps every tool", () => {
+  const result = run({ sessions: TEAM, modes: { ses_fg: "auto" }, steps: [
+    { event: taskPartEvent(3, "ses_root", "ses_fg", { metadata: { background: true } }) },
+    { tool: "schedule_prompt", sessionID: "ses_fg", args: { in_minutes: 5, text: "x" } },
+  ] });
+  assert.deepEqual(result.outcomes, ["ran"]);
+});
+
+test("G4 through the hook: an index miss is answered from the root's history", () => {
+  const creating = taskPartEvent(2, "ses_root", "ses_mate", { input: { background: true } }).properties.part;
+  const messages = { ses_root: [{ info: { id: "msg_0002", sessionID: "ses_root", role: "assistant" }, parts: [creating] }] };
+  const result = run({ sessions: TEAM, messages, modes: { ses_mate: "auto" }, steps: [
+    { tool: "peer_send", sessionID: "ses_mate", args: { to: "x", text: "hi" } },
+  ] });
+  assert.match(result.outcomes[0], /^\[opencode-guard\] denied \(G4, tools closed to agent teams\): `peer_send`/);
+  assert.deepEqual(result.pages, [{ id: "ses_root", query: { directory: "/work", limit: 50 } }]);
+});
+
+test("level off leaves the tree rules out like everything else", () => {
+  const result = run({ sessions: TEAM, level: "off", steps: [
+    { tool: "task", sessionID: "ses_mate", args: spawnArgs({ task_id: "ses_fg" }) },
+  ] });
+  assert.deepEqual(result.outcomes, ["ran"]);
+  assert.deepEqual(result.gets, [], "off means nothing from this plugin, including session lookups");
+});

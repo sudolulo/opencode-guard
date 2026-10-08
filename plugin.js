@@ -81,7 +81,7 @@ import { classifierConfig, classifierRoute, classifyDirect, verdictFromText } fr
 import { createLoopGuard, createLoopGuardHook, loopGuardOptions } from "./lib/loop-guard.js";
 import { createNotifier } from "./lib/notify.js";
 import { loadSafetyNet, safetyNetVerdict } from "./lib/safety-net.js";
-import { createSessionTree, treeLookupDenial } from "./lib/tree.js";
+import { createSessionTree, createTeamIndex, treeLookupDenial, treeRuleRefusal } from "./lib/tree.js";
 
 // Server plugins receive the legacy SDK client. The matching V2 client below
 // keeps its embedded-app fetch transport while generating V2 request bodies.
@@ -346,6 +346,9 @@ const routeFor = async (sessionID) => {
 // mode, which may be looser than every ancestor.
 // sessionTree closes over the PluginInput client, so it is built in the factory.
 const sessionTree = createSessionTree({ client, directory });
+// The teammate classification G4 needs (lib/tree.js), over the same tree. The event
+// hook feeds it task parts; on a miss it pages the root's history.
+const teamIndex = createTeamIndex({ client, directory, tree: sessionTree });
 // ☠️ modeFor MUST stay inside the factory, below infoFor -- infoFor closes over
 // v2Client, which closes over the PluginInput client, so neither can live at
 // module scope. Declared above the factory (0.4.8) it threw "infoFor is not
@@ -760,6 +763,20 @@ const modeFor = async (sessionID) => {
         }
       }
 
+      // Tree rules G1, G2 and G4 (agent teams; lib/tree.js). Above the config deny
+      // rules and the god bypass, for the reason D1 is: they bound which sessions a
+      // call may reach and what a team may use, not what a session may run, and god
+      // is a grant over the floor, not over the session tree. Every lookup that
+      // fails comes back as a denial naming its rule. G3 is in modeFor.
+      const treeRefusal = await treeRuleRefusal({
+        tool: input?.tool, sessionID: input?.sessionID, args: output?.args,
+        unattended: isUnattended, tree: sessionTree, team: teamIndex,
+      });
+      if (treeRefusal) {
+        log(`deny(${input?.tool ?? "?"}/tree)`, `${input?.sessionID ?? "?"}: ${treeRefusal}`);
+        throw new Error(treeRefusal);
+      }
+
       // God mode: the person asked for everything to run, floor included, and
       // said so in a mode labelled god. Stand aside before the floor, not after --
       // half a bypass would be a floor that "sometimes" applies, which is worse
@@ -974,6 +991,14 @@ const modeFor = async (sessionID) => {
       await loopHook.after(input, output);
     },
     event: async ({ event }) => {
+      // Agent teams: index every task part that names a child, at every level, so
+      // turning the guard back on finds the index current. observe() does not throw
+      // on any event shape; the catch is for the unforeseen, and it is logged.
+      try {
+        teamIndex.observe(event);
+      } catch (error) {
+        log("tree-index-error", error?.message ?? error);
+      }
       try {
         await notifier.onEvent(event);
         if (event?.type === "session.deleted") {

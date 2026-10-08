@@ -323,3 +323,143 @@ test("the classification index is bounded and falls back to history after evicti
   assert.equal(await team.classifyChild("ses_mate", "ses_root"), true, "evicted, then read back from history");
   assert.equal(messageCalls().length, 1);
 });
+// ---- G1, G2 and G4 (spec section 4, rule table).
+
+// Adds a second root with a child of its own.
+const TREE_SESSIONS = { ...SESSIONS, ses_other: null, ses_otherkid: "ses_other" };
+const MATE_EVENT = partEvent(taskPart(2, "ses_root", "ses_mate", { input: { background: true } }));
+
+const rules = ({ sessions = SESSIONS, history: hist = { ses_root: [] }, events = [], unattended = false, getThrows = [] } = {}) => {
+  const fake = fakeClient({ sessions, history: hist, getThrows });
+  const tree = T.createSessionTree({ client: fake.client, directory: "/work" });
+  const team = T.createTeamIndex({ client: fake.client, directory: "/work", tree });
+  for (const event of events) team.observe(event);
+  const check = (sessionID, tool, args = {}) => T.treeRuleRefusal({ tool, sessionID, args, unattended, tree, team });
+  return { check, calls: fake.calls };
+};
+const spawn = (extra = {}) => ({ description: "d", prompt: "p", subagent_type: "build", ...extra });
+const resume = (taskID, extra = {}) => spawn({ task_id: taskID, ...extra });
+
+test("G1: a session may resume its own child, and the child is re-read every time", async () => {
+  const { check, calls } = rules();
+  assert.equal(await check("ses_root", "task", resume("ses_fg")), null);
+  assert.equal(await check("ses_root", "task", resume("ses_fg")), null);
+  assert.equal(calls.filter((c) => c.op === "get" && c.id === "ses_fg").length, 2);
+  assert.equal(await check("ses_mate", "task", resume("ses_helper")), null, "a teammate resumes its own helper");
+});
+
+test("G1: sibling, lead, other-root, grandchild and own ids are refused", async () => {
+  const { check } = rules({ sessions: TREE_SESSIONS });
+  assert.match(await check("ses_mate", "task", resume("ses_fg")),
+    /^\[opencode-guard\] denied \(G1, resume only your own child\): task_id ses_fg is not a child of this session \(its parent is ses_root\)/);
+  assert.match(await check("ses_mate", "task", resume("ses_root")),
+    /task_id ses_root is not a child of this session \(it is a root session\)/);
+  assert.match(await check("ses_root", "task", resume("ses_otherkid")), /\(its parent is ses_other\)/);
+  assert.match(await check("ses_root", "task", resume("ses_other")), /\(it is a root session\)/);
+  assert.match(await check("ses_root", "task", resume("ses_root")), /G1, resume only your own child/,
+    "a session cannot resume itself");
+  assert.match(await check("ses_root", "task", resume("ses_helper")), /\(its parent is ses_mate\)/,
+    "a grandchild is not a child");
+});
+
+test("G1: a nonexistent id, a failed lookup and a malformed id are refused; an empty id is no resume", async () => {
+  const { check, calls } = rules({ getThrows: ["ses_flaky"] });
+  assert.match(await check("ses_root", "task", resume("ses_nope")), /task_id ses_nope names no existing session/);
+  const flaky = await check("ses_root", "task", resume("ses_flaky"));
+  assert.match(flaky, /^\[opencode-guard\] denied \(G1, resume only your own child\): the guard could not check/);
+  assert.match(flaky, /Retry once/);
+  assert.match(await check("ses_root", "task", resume(42)), /task_id must be a session id string, not number/);
+  const before = calls.length;
+  assert.equal(await check("ses_root", "task", resume("")), null, "opencode treats an empty task_id as a new task");
+  assert.equal(calls.length, before, "and the guard looks nothing up for it");
+});
+
+test("G1: a child deleted after an allowed resume is refused on the next one", async () => {
+  const sessions = { ...SESSIONS };
+  const { check } = rules({ sessions });
+  assert.equal(await check("ses_root", "task", resume("ses_fg")), null);
+  delete sessions.ses_fg;
+  assert.match(await check("ses_root", "task", resume("ses_fg")), /task_id ses_fg names no existing session/,
+    "a cached parent link must not vouch for a session that is gone: opencode would start a fresh child");
+});
+
+test("G2: background tasks only from an attended root, and never with task_id", async () => {
+  const attended = rules();
+  assert.equal(await attended.check("ses_root", "task", spawn({ background: true })), null);
+  assert.match(await attended.check("ses_mate", "task", spawn({ background: true })),
+    /^\[opencode-guard\] denied \(G2, background teammates only from an attended root\): `background: true` is allowed only from a root session; this session is a subagent of ses_root/);
+  assert.match(await attended.check("ses_helper", "task", spawn({ background: true })), /subagent of ses_mate/);
+  assert.match(await attended.check("ses_root", "task", resume("ses_fg", { background: true })),
+    /cannot be combined with `task_id`/);
+  assert.equal(await attended.check("ses_mate", "task", spawn()), null, "a teammate may still dispatch foreground helpers");
+  const headless = rules({ unattended: true });
+  assert.match(await headless.check("ses_root", "task", spawn({ background: true })), /allowed only in an attended session/);
+  assert.equal(headless.calls.length, 0, "decided without a lookup");
+  const flaky = rules({ getThrows: ["ses_root"] });
+  assert.match(await flaky.check("ses_root", "task", spawn({ background: true })), /G2, background.*Retry once/s);
+});
+
+const CLOSED = [
+  ["workflow_run", { name: "review-panel" }],
+  ["peer_send", { to: "x", text: "hi" }],
+  ["peer_list", {}],
+  ["schedule_prompt", { in_minutes: 5, text: "x" }],
+  ["schedule_cancel", { id: "s1" }],
+  ["bg_watch", { job: "j", pattern: "x" }],
+  ["bg_unwatch", { watch: "w" }],
+  ["bg_list", { all: true }],
+  ["bg_output", { id: "j", all: true }],
+  ["bg_kill", { id: "j", all: true }],
+];
+const OPEN = [
+  ["bg_list", {}],
+  ["bg_output", { id: "j" }],
+  ["bg_kill", { id: "j", all: false }],
+  ["bg_run", { command: "x" }],
+  ["read", { filePath: "/work/a" }],
+  ["bash", { command: "ls" }],
+  ["task", spawn()],
+];
+
+test("G4: a teammate and its helpers cannot use the tools closed to teams", async () => {
+  const { check } = rules({ events: [MATE_EVENT] });
+  for (const sessionID of ["ses_mate", "ses_helper"]) {
+    for (const [tool, args] of CLOSED) {
+      const refusal = await check(sessionID, tool, args);
+      assert.match(refusal ?? "", /^\[opencode-guard\] denied \(G4, tools closed to agent teams\): `/, `${sessionID} ${tool}`);
+      assert.match(refusal, /team_report/);
+    }
+    for (const [tool, args] of OPEN) assert.equal(await check(sessionID, tool, args), null, `${sessionID} ${tool}`);
+  }
+});
+
+test("G4: the lead, ordinary children and other roots keep every tool", async () => {
+  const { check, calls } = rules({
+    sessions: TREE_SESSIONS,
+    events: [MATE_EVENT, partEvent(taskPart(3, "ses_root", "ses_fg"))],
+  });
+  for (const sessionID of ["ses_root", "ses_fg", "ses_fghelper", "ses_other"]) {
+    for (const [tool, args] of CLOSED) assert.equal(await check(sessionID, tool, args), null, `${sessionID} ${tool}`);
+  }
+  assert.equal(calls.filter((c) => c.op === "messages").length, 0);
+});
+
+test("G4: any all other than false, null or absent counts as all: true", async () => {
+  const { check } = rules({ events: [MATE_EVENT] });
+  for (const all of [true, "true", 1, "yes"]) {
+    assert.match(await check("ses_mate", "bg_list", { all }) ?? "", /`bg_list with all: true`/, String(all));
+  }
+  for (const all of [false, undefined, null]) assert.equal(await check("ses_mate", "bg_list", { all }), null, String(all));
+});
+
+test("G4: an unclassifiable caller is refused; a workflow child is told retrying will not help", async () => {
+  const flaky = rules({ getThrows: ["ses_mate"] });
+  assert.match(await flaky.check("ses_mate", "schedule_prompt", { in_minutes: 1, text: "x" }), /G4, tools closed.*Retry once/s);
+  const workflow = rules({ history: { ses_root: history("ses_root", 2) } });
+  const refusal = await workflow.check("ses_wf", "schedule_prompt", { in_minutes: 1, text: "x" });
+  assert.match(refusal, /^\[opencode-guard\] denied \(G4, tools closed to agent teams\): the guard could not check this rule/);
+  assert.match(refusal, /no task call in session ses_root created session ses_wf/);
+  assert.match(refusal, /retrying will not change the answer/);
+  assert.equal(await workflow.check("ses_wf", "read", { filePath: "/work/a" }), null,
+    "only the closed tools need a classification");
+});

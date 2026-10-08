@@ -137,3 +137,189 @@ test("a lookup denial names the rule and says whether retrying can help", () => 
   assert.equal(T.treeDenial("G1", "x"), "[opencode-guard] denied (G1, resume only your own child): x");
   assert.equal(T.treeDenial("G2", "y"), "[opencode-guard] denied (G2, background teammates only from an attended root): y");
 });
+// ---- Teammate classification (spec section 4, "Teammate classification").
+
+const pad = (n) => String(n).padStart(4, "0");
+const msgId = (n) => `msg_${pad(n)}`;
+// A task tool part in message n of `root` that names `child` in state.metadata.sessionId.
+const taskPart = (n, root, child, { input = {}, metadata = {}, part = 0 } = {}) => ({
+  id: `prt_${pad(n)}_${part}`, sessionID: root, messageID: msgId(n), type: "tool", tool: "task", callID: `call_${n}_${part}`,
+  state: {
+    status: "completed",
+    input: { description: "d", prompt: "p", subagent_type: "build", ...input },
+    metadata: { sessionId: child, ...metadata },
+    output: "", title: "d", time: { start: n, end: n },
+  },
+});
+const message = (n, root, parts) => ({ info: { id: msgId(n), sessionID: root, role: "assistant" }, parts });
+// `count` messages of `root`, oldest first; `at` puts given parts into message numbers.
+const history = (root, count, at = {}) => Array.from({ length: count }, (_, i) => message(i + 1, root,
+  at[i + 1] ?? [{ id: `prt_${pad(i + 1)}_0`, sessionID: root, messageID: msgId(i + 1), type: "text", text: "work" }]));
+const partEvent = (part) => ({ type: "message.part.updated", properties: { sessionID: part.sessionID, part, time: 1 } });
+
+// ses_mate: a teammate of ses_root; ses_helper: its foreground helper. ses_fg: a
+// foreground child of ses_root; ses_fghelper: its helper. ses_two: another child.
+// ses_wf: a workflow child (SDK-created with parentID = ses_root, no task part).
+const SESSIONS = {
+  ses_root: null, ses_mate: "ses_root", ses_helper: "ses_mate", ses_fg: "ses_root",
+  ses_fghelper: "ses_fg", ses_two: "ses_root", ses_wf: "ses_root",
+};
+
+const teamFixture = ({ sessions = SESSIONS, history: hist = {}, messagesFail = null, limits } = {}) => {
+  const fake = fakeClient({ sessions, history: hist, messagesFail });
+  const tree = T.createSessionTree({ client: fake.client, directory: "/work" });
+  const team = T.createTeamIndex({ client: fake.client, directory: "/work", tree, ...(limits ? { limits } : {}) });
+  const messageCalls = () => fake.calls.filter((c) => c.op === "messages");
+  return { team, tree, calls: fake.calls, messageCalls };
+};
+
+test("an indexed background spawn makes its child a teammate without reading history", async () => {
+  const { team, messageCalls } = teamFixture({ history: { ses_root: [] } });
+  team.observe(partEvent(taskPart(3, "ses_root", "ses_mate", { input: { background: true } })));
+  assert.equal(await team.classifyChild("ses_mate", "ses_root"), true);
+  assert.equal(messageCalls().length, 0);
+});
+
+test("a task part that has not created a child is never indexed", async () => {
+  // Spike S4: the part is published as running, with its input, before any
+  // tool.execute.before hook runs; only a created child gets metadata.sessionId.
+  const { team, messageCalls } = teamFixture({
+    history: { ses_root: history("ses_root", 4, { 2: [taskPart(2, "ses_root", "ses_fg")] }) },
+  });
+  const pending = taskPart(3, "ses_root", "ses_fg", { input: { background: true } });
+  pending.state = { status: "running", input: pending.state.input, time: { start: 3 } };
+  team.observe(partEvent(pending));
+  team.observe(partEvent({ id: "prt_x", sessionID: "ses_root", messageID: msgId(9), type: "text", text: "x" }));
+  assert.equal(await team.classifyChild("ses_fg", "ses_root"), false,
+    "decided by the persisted creating part, a foreground call");
+  assert.equal(messageCalls().length, 1, "the index held nothing for ses_fg, so history was read");
+});
+
+test("a promoted foreground task is not a teammate, from the index or from history", async () => {
+  // F19 and spike S6: promotion sets metadata.background and leaves input.background absent.
+  const promoted = taskPart(2, "ses_root", "ses_fg", { metadata: { background: true } });
+  const viaIndex = teamFixture({ history: { ses_root: [] } });
+  viaIndex.team.observe(partEvent(promoted));
+  assert.equal(await viaIndex.team.classifyChild("ses_fg", "ses_root"), false);
+  const viaHistory = teamFixture({ history: { ses_root: history("ses_root", 3, { 2: [promoted] }) } });
+  assert.equal(await viaHistory.team.classifyChild("ses_fg", "ses_root"), false);
+});
+
+test("the oldest part naming a child decides, whatever order its events arrive in", async () => {
+  const { team, messageCalls } = teamFixture({ history: { ses_root: [] } });
+  // A later foreground call naming the same child (a resume) is seen first.
+  team.observe(partEvent(taskPart(9, "ses_root", "ses_mate")));
+  team.observe(partEvent(taskPart(4, "ses_root", "ses_mate", { input: { background: true } })));
+  team.observe(partEvent(taskPart(12, "ses_root", "ses_mate")));
+  assert.equal(await team.classifyChild("ses_mate", "ses_root"), true);
+  // Same message: the lower part id is the older part.
+  team.observe(partEvent(taskPart(20, "ses_root", "ses_two", { part: 1 })));
+  team.observe(partEvent(taskPart(20, "ses_root", "ses_two", { part: 0, input: { background: true } })));
+  assert.equal(await team.classifyChild("ses_two", "ses_root"), true);
+  assert.equal(messageCalls().length, 0);
+});
+
+test("on an index miss the root's history is paged back to its first message", async () => {
+  // 120 messages: the pages of 50 are 71-120, 21-70 and 1-20. The creating background
+  // call is in message 3; a later foreground resume of the same child is in message 110.
+  const hist = history("ses_root", 120, {
+    3: [taskPart(3, "ses_root", "ses_mate", { input: { background: true } })],
+    110: [taskPart(110, "ses_root", "ses_mate")],
+  });
+  const { team, messageCalls } = teamFixture({ history: { ses_root: hist } });
+  assert.equal(await team.classifyChild("ses_mate", "ses_root"), true);
+  assert.deepEqual(messageCalls().map((c) => c.query), [
+    { directory: "/work", limit: 50 },
+    { directory: "/work", limit: 50, before: msgId(71) },
+    { directory: "/work", limit: 50, before: msgId(21) },
+  ]);
+  assert.ok(messageCalls().every((c) => c.id === "ses_root"));
+});
+
+test("a found answer is final; a child no task call created is not cached and fails every time", async () => {
+  const hist = history("ses_root", 5, {
+    2: [taskPart(2, "ses_root", "ses_mate", { input: { background: true } })],
+    4: [taskPart(4, "ses_root", "ses_fg")],
+  });
+  const { team, messageCalls } = teamFixture({ history: { ses_root: hist } });
+  assert.equal(await team.classifyChild("ses_mate", "ses_root"), true);
+  assert.equal(await team.classifyChild("ses_fg", "ses_root"), false);
+  assert.equal(messageCalls().length, 2);
+  assert.equal(await team.classifyChild("ses_mate", "ses_root"), true);
+  assert.equal(await team.classifyChild("ses_fg", "ses_root"), false);
+  assert.equal(messageCalls().length, 2, "positive and negative answers are both final");
+  for (let i = 0; i < 2; i += 1) {
+    const error = await team.classifyChild("ses_wf", "ses_root").catch((e) => e);
+    assert.ok(error instanceof T.TreeLookupError);
+    assert.equal(error.missing, true);
+    assert.match(error.message, /no task call in session ses_root created session ses_wf/);
+  }
+  assert.equal(messageCalls().length, 4, "not found is never cached");
+});
+
+test("a history read that fails is a failed lookup, never a classification", async () => {
+  for (const messagesFail of ["throw", "error", "shape"]) {
+    const { team } = teamFixture({ messagesFail });
+    const error = await team.classifyChild("ses_mate", "ses_root").catch((e) => e);
+    assert.ok(error instanceof T.TreeLookupError, messagesFail);
+    assert.equal(error.missing, false, messagesFail);
+  }
+  const broken = taskPart(2, "ses_root", "ses_mate", { input: { background: true } });
+  delete broken.id;
+  delete broken.messageID;
+  const { team } = teamFixture({ history: { ses_root: [{ info: {}, parts: [broken] }] } });
+  const error = await team.classifyChild("ses_mate", "ses_root").catch((e) => e);
+  assert.ok(error instanceof T.TreeLookupError, "a part that cannot be ordered cannot be the oldest");
+  assert.match(error.message, /has no message or part id/);
+});
+
+test("paging that never ends is a failed lookup, not a hang", async () => {
+  const stuck = teamFixture({ messagesFail: "stuck" });
+  const repeated = await stuck.team.classifyChild("ses_mate", "ses_root").catch((e) => e);
+  assert.ok(repeated instanceof T.TreeLookupError);
+  assert.match(repeated.message, /repeated cursor same/);
+  assert.equal(stuck.messageCalls().length, 2);
+  const long = teamFixture({
+    history: { ses_root: history("ses_root", 120, { 110: [taskPart(110, "ses_root", "ses_mate")] }) },
+    limits: { ...T.TEAM_LIMITS, maxPages: 2 },
+  });
+  const capped = await long.team.classifyChild("ses_mate", "ses_root").catch((e) => e);
+  assert.ok(capped instanceof T.TreeLookupError,
+    "a match on a newer page is not known to be the oldest until the first page is read");
+  assert.match(capped.message, /longer than 2 pages of 50 messages/);
+});
+
+test("in a team means a teammate or anything below one", async () => {
+  const { team, messageCalls } = teamFixture({ history: { ses_root: [] } });
+  team.observe(partEvent(taskPart(2, "ses_root", "ses_mate", { input: { background: true } })));
+  team.observe(partEvent(taskPart(3, "ses_root", "ses_fg")));
+  assert.equal(await team.inTeam("ses_root"), false);
+  assert.equal(messageCalls().length, 0, "a root needs no classification");
+  assert.equal(await team.inTeam("ses_mate"), true);
+  assert.equal(await team.inTeam("ses_helper"), true, "a teammate's foreground helper is in the team");
+  assert.equal(await team.inTeam("ses_fg"), false);
+  assert.equal(await team.inTeam("ses_fghelper"), false);
+});
+
+test("a child of a root that no task call created cannot be classified", async () => {
+  // agent-workflows creates workflow children through the SDK with parentID set to
+  // the calling root; no task part in the root names them.
+  const { team } = teamFixture({ history: { ses_root: history("ses_root", 3) } });
+  const error = await team.inTeam("ses_wf").catch((e) => e);
+  assert.ok(error instanceof T.TreeLookupError);
+  assert.equal(error.missing, true);
+});
+
+test("the classification index is bounded and falls back to history after eviction", async () => {
+  const hist = history("ses_root", 4, { 2: [taskPart(2, "ses_root", "ses_mate", { input: { background: true } })] });
+  const { team, messageCalls } = teamFixture({
+    history: { ses_root: hist }, limits: { ...T.TEAM_LIMITS, classificationCache: 2 },
+  });
+  team.observe(partEvent(taskPart(2, "ses_root", "ses_mate", { input: { background: true } })));
+  team.observe(partEvent(taskPart(3, "ses_root", "ses_fg")));
+  team.observe(partEvent(taskPart(4, "ses_root", "ses_two")));
+  assert.equal(await team.classifyChild("ses_two", "ses_root"), false);
+  assert.equal(messageCalls().length, 0);
+  assert.equal(await team.classifyChild("ses_mate", "ses_root"), true, "evicted, then read back from history");
+  assert.equal(messageCalls().length, 1);
+});

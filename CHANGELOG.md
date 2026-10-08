@@ -7,6 +7,12 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.7.1] — 2026-10-08
+
+### Fixed
+
+- A tool call resolves its permission mode once instead of up to three times, so it no longer re-walks session ancestry and re-reads mode files per check, and one call cannot see two different modes. A G3 lookup failure still denies.
+
 ## [1.7.0] — 2026-10-08
 
 ### Added

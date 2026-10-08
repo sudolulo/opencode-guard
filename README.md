@@ -397,6 +397,14 @@ the root on the caller's path, so a workflow child started from a foreground
 subagent is classified by that subagent's (foreground) `task` part and keeps
 these tools.
 
+Only a creating part counts: a `task` part that carries `task_id` (a resume)
+never classifies a child, so a foreground resume of a teammate cannot make it
+look like an outsider. A "no creating part" answer is remembered for 30 seconds
+so a retried call does not re-page up to 200 pages of history; a stale entry can
+only refuse. A history page that arrives without paging headers counts as the
+last page only when it is short, and a transient (5xx or transport) session read
+is retried once before the lookup fails.
+
 Level `off` skips G1, G2 and G4, like the other checks that run before a tool
 call; the teammate index is still fed from events at every level.
 

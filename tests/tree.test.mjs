@@ -10,7 +10,7 @@ const T = await import(new URL("../lib/tree.js", import.meta.url).href);
 // cuts them (newest `limit` first, each page oldest-first, X-Next-Cursor naming the
 // oldest message of a page when older ones remain). The objects are read live, so
 // a test may mutate them between calls.
-const fakeClient = ({ sessions = {}, getThrows = [], getStatus = {}, history = {}, messagesFail = null } = {}) => {
+const fakeClient = ({ sessions = {}, getThrows = [], getStatus = {}, history = {}, messagesFail = null, messagesNoResponse = false } = {}) => {
   const calls = [];
   const notFound = (id) => ({
     error: { name: "NotFoundError", data: { message: `Session not found: ${id}` } },
@@ -44,7 +44,9 @@ const fakeClient = ({ sessions = {}, getThrows = [], getStatus = {}, history = {
         const start = Math.max(0, end - query.limit);
         const headers = new Headers();
         if (start > 0) headers.set("X-Next-Cursor", all[start].info.id);
-        return { data: all.slice(start, end), response: { status: 200, headers } };
+        const reply = { data: all.slice(start, end), response: { status: 200, headers } };
+        if (messagesNoResponse) delete reply.response;
+        return reply;
       },
     },
   };
@@ -82,6 +84,32 @@ test("readSession tells a session that does not exist from a lookup that failed"
   });
   const noData = await bare.readSession("ses_x").catch((e) => e);
   assert.ok(noData instanceof T.TreeLookupError, "a reply without a session record is a failure, never a root");
+});
+
+test("readSession retries one transient failure but not a missing session", async () => {
+  const reply = (status) => status === 200
+    ? { data: { id: "ses_x" }, response: { status } }
+    : { error: { name: "UnknownError", data: { message: "boom" } }, response: { status } };
+  let calls = 0;
+  const once = T.createSessionTree({
+    client: { session: { get: async () => reply([503, 200][calls++]) } }, directory: "/work",
+  });
+  assert.deepEqual(await once.readSession("ses_x"), { parentID: null });
+  assert.equal(calls, 2);
+  calls = 0;
+  const missing = T.createSessionTree({
+    client: { session: { get: async () => reply([404, 200][calls++]) } }, directory: "/work",
+  });
+  const missingError = await missing.readSession("ses_x").catch((e) => e);
+  assert.equal(missingError.missing, true);
+  assert.equal(calls, 1);
+  calls = 0;
+  const twice = T.createSessionTree({
+    client: { session: { get: async () => reply([503, 503][calls++]) } }, directory: "/work",
+  });
+  const failed = await twice.readSession("ses_x").catch((e) => e);
+  assert.ok(failed instanceof T.TreeLookupError);
+  assert.equal(calls, 2);
 });
 
 test("ancestry walks parent links to the root and remembers them", async () => {
@@ -165,10 +193,11 @@ const SESSIONS = {
   ses_fghelper: "ses_fg", ses_two: "ses_root", ses_wf: "ses_root",
 };
 
-const teamFixture = ({ sessions = SESSIONS, history: hist = {}, messagesFail = null, limits } = {}) => {
-  const fake = fakeClient({ sessions, history: hist, messagesFail });
+const teamFixture = ({ sessions = SESSIONS, history: hist = {}, messagesFail = null, messagesNoResponse = false, limits, now } = {}) => {
+  const fake = fakeClient({ sessions, history: hist, messagesFail, messagesNoResponse });
   const tree = T.createSessionTree({ client: fake.client, directory: "/work" });
-  const team = T.createTeamIndex({ client: fake.client, directory: "/work", tree, ...(limits ? { limits } : {}) });
+  const team = T.createTeamIndex({ client: fake.client, directory: "/work", tree,
+    ...(limits ? { limits } : {}), ...(now ? { now } : {}) });
   const messageCalls = () => fake.calls.filter((c) => c.op === "messages");
   return { team, tree, calls: fake.calls, messageCalls };
 };
@@ -208,15 +237,26 @@ test("a promoted foreground task is not a teammate, from the index or from histo
 test("the oldest part naming a child decides, whatever order its events arrive in", async () => {
   const { team, messageCalls } = teamFixture({ history: { ses_root: [] } });
   // A later foreground call naming the same child (a resume) is seen first.
-  team.observe(partEvent(taskPart(9, "ses_root", "ses_mate")));
+  team.observe(partEvent(taskPart(9, "ses_root", "ses_mate", { input: { task_id: "ses_mate" } })));
   team.observe(partEvent(taskPart(4, "ses_root", "ses_mate", { input: { background: true } })));
-  team.observe(partEvent(taskPart(12, "ses_root", "ses_mate")));
+  team.observe(partEvent(taskPart(12, "ses_root", "ses_mate", { input: { task_id: "ses_mate" } })));
   assert.equal(await team.classifyChild("ses_mate", "ses_root"), true);
   // Same message: the lower part id is the older part.
   team.observe(partEvent(taskPart(20, "ses_root", "ses_two", { part: 1 })));
   team.observe(partEvent(taskPart(20, "ses_root", "ses_two", { part: 0, input: { background: true } })));
   assert.equal(await team.classifyChild("ses_two", "ses_root"), true);
   assert.equal(messageCalls().length, 0);
+});
+
+test("resume parts do not classify a child from the index or history", async () => {
+  const hist = history("ses_root", 120, {
+    3: [taskPart(3, "ses_root", "ses_mate", { input: { background: true } })],
+    110: [taskPart(110, "ses_root", "ses_mate", { input: { task_id: "ses_mate" } })],
+  });
+  const { team, messageCalls } = teamFixture({ history: { ses_root: hist } });
+  team.observe(partEvent(taskPart(110, "ses_root", "ses_mate", { input: { task_id: "ses_mate" } })));
+  assert.equal(await team.inTeam("ses_mate"), true);
+  assert.equal(messageCalls().length, 3, "the ignored resume event falls through to complete history");
 });
 
 test("on an index miss the root's history is paged back to its first message", async () => {
@@ -236,12 +276,13 @@ test("on an index miss the root's history is paged back to its first message", a
   assert.ok(messageCalls().every((c) => c.id === "ses_root"));
 });
 
-test("a found answer is final; a child no task call created is not cached and fails every time", async () => {
+test("a found answer is final; a child no task call created is briefly cached as missing", async () => {
   const hist = history("ses_root", 5, {
     2: [taskPart(2, "ses_root", "ses_mate", { input: { background: true } })],
     4: [taskPart(4, "ses_root", "ses_fg")],
   });
-  const { team, messageCalls } = teamFixture({ history: { ses_root: hist } });
+  let time = 0;
+  const { team, messageCalls } = teamFixture({ history: { ses_root: hist }, now: () => time });
   assert.equal(await team.classifyChild("ses_mate", "ses_root"), true);
   assert.equal(await team.classifyChild("ses_fg", "ses_root"), false);
   assert.equal(messageCalls().length, 2);
@@ -254,7 +295,12 @@ test("a found answer is final; a child no task call created is not cached and fa
     assert.equal(error.missing, true);
     assert.match(error.message, /no task call in session ses_root created session ses_wf/);
   }
-  assert.equal(messageCalls().length, 4, "not found is never cached");
+  assert.equal(messageCalls().length, 3, "the second missing result is served from the short negative cache");
+  time += T.TEAM_LIMITS.missingTtlMs;
+  const expired = await team.classifyChild("ses_wf", "ses_root").catch((e) => e);
+  assert.ok(expired instanceof T.TreeLookupError);
+  assert.equal(expired.missing, true);
+  assert.equal(messageCalls().length, 4, "after the TTL, missing history is read again");
 });
 
 test("a history read that fails is a failed lookup, never a classification", async () => {
@@ -287,6 +333,21 @@ test("paging that never ends is a failed lookup, not a hang", async () => {
   assert.ok(capped instanceof T.TreeLookupError,
     "a match on a newer page is not known to be the oldest until the first page is read");
   assert.match(capped.message, /longer than 2 pages of 50 messages/);
+});
+
+test("a page without headers is final only when it is short", async () => {
+  const short = teamFixture({
+    history: { ses_root: history("ses_root", 1, { 1: [taskPart(1, "ses_root", "ses_mate", { input: { background: true } })] }) },
+    messagesNoResponse: true,
+  });
+  assert.equal(await short.team.classifyChild("ses_mate", "ses_root"), true);
+  const full = teamFixture({
+    history: { ses_root: history("ses_root", 50, { 50: [taskPart(50, "ses_root", "ses_mate", { input: { background: true } })] }) },
+    messagesNoResponse: true,
+  });
+  const error = await full.team.classifyChild("ses_mate", "ses_root").catch((e) => e);
+  assert.ok(error instanceof T.TreeLookupError);
+  assert.match(error.message, /cannot page the messages of session ses_root: the reply carried no headers/);
 });
 
 test("in a team means a teammate or anything below one", async () => {

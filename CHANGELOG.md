@@ -19,6 +19,7 @@ were released privately as opencode-guardrails.
   - Teammates are recognised by the `task` part that created them (`state.input.background`), indexed from `message.part.updated` events, with a paged read of the root's history when the index has no entry. A foreground task promoted to the background is not a teammate.
   - G4 fails closed: a child of a root with no creating `task` part in the root's history (for example an SDK-created opencode-agent-workflows workflow child) is treated as possibly in a team, and it and everything below it are refused the tools above, with a refusal that says retrying will not help. This is deliberate, because a teammate's creating part can disappear from the root's history (a revert removes it). Classification is decided by the session just below the root on the caller's path, so a workflow child started from a foreground subagent is classified by that subagent's part and keeps these tools. Behaviour change: a workflow step started directly from a root that calls one of these tools is now refused.
   - Level `off` skips G1, G2 and G4, like the other pre-run checks; the teammate index is still fed at every level.
+  - Only creating parts classify: a resume part (`task_id` set) is ignored, from events and from history. A "no creating part" answer is cached for 30 seconds (it can only refuse). A history page without paging headers ends the scan only when it is short, and a transient session read is retried once.
 
 ### Changed
 

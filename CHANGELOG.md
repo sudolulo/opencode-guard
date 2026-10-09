@@ -7,6 +7,12 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-10-09
+
+### Changed
+
+- G4 keeps `agent_list` / `agent_send` open to a team session -- now a teammate's only way to reach its lead, and confined by opencode-peers to its lead and its own subagents -- while the legacy `peer_*` tools stay closed. Its refusal points teammates at `agent_send`.
+
 ### Added
 
 - **A session can no longer start another OpenCode or agent session, however indirectly.** Work is delegated only to the session's own subagents. Every agent shell now carries `OPENCODE_AGENT_SHELL=1` (a new `shell.env` hook; the user's PTY panes, which carry no session, stay unmarked), and an OpenCode process that starts under it exits 78 at plugin load -- so `bash -c "opencode run ..."`, `nohup`, a script or a subprocess are refused at launch, not just the literal command the bash rules see. For routes that start a command in a fresh environment, which the marker cannot follow, `tool.execute.before` refuses (above every mode, god and off included): a launcher named anywhere in a command sent through tmux, ssh to this host, systemd-run, at/batch, sudo/su or `env -i`; tmux starting anything on the user's own server; systemd-run without `--scope`, at/batch and ssh to this host outright; and any write to the local OpenCode server's `/session` API. Commands that only mention a launcher (a commit message, a heredoc, grep) are left alone. See `lib/agent-spawn.js`.

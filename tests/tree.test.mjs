@@ -473,6 +473,9 @@ const CLOSED = [
   ["bg_kill", { id: "j", all: true }],
 ];
 const OPEN = [
+  // A teammate's only way to reach its lead (opencode-peers confines it to its lead).
+  ["agent_send", { to: "lead", message: "found it" }],
+  ["agent_list", {}],
   ["bg_list", {}],
   ["bg_output", { id: "j" }],
   ["bg_kill", { id: "j", all: false }],
@@ -488,7 +491,7 @@ test("G4: a teammate and its helpers cannot use the tools closed to teams", asyn
     for (const [tool, args] of CLOSED) {
       const refusal = await check(sessionID, tool, args);
       assert.match(refusal ?? "", /^\[opencode-guard\] denied \(G4, tools closed to agent teams\): `/, `${sessionID} ${tool}`);
-      assert.match(refusal, /team_report/);
+      assert.match(refusal, /agent_send/);
     }
     for (const [tool, args] of OPEN) assert.equal(await check(sessionID, tool, args), null, `${sessionID} ${tool}`);
   }

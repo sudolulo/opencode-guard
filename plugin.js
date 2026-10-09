@@ -82,6 +82,7 @@ import { createLoopGuard, createLoopGuardHook, loopGuardOptions } from "./lib/lo
 import { createNotifier } from "./lib/notify.js";
 import { loadSafetyNet, safetyNetVerdict } from "./lib/safety-net.js";
 import { createSessionTree, createTeamIndex, treeLookupDenial, treeRuleRefusal } from "./lib/tree.js";
+import { AGENT_SHELL_ENV, AGENT_SPAWN_REFUSAL, agentSpawnRefusal } from "./lib/agent-spawn.js";
 
 // Server plugins receive the legacy SDK client. The matching V2 client below
 // keeps its embedded-app fetch transport while generating V2 request bodies.
@@ -178,6 +179,11 @@ const controlDeny =
   "in their own terminal. If the change is really needed, say so and let the user make it.";
 
 export const OpencodeGuard = async ({ client, directory }) => {
+  if (process.env[AGENT_SHELL_ENV] === "1") {
+    // Not a thrown error: a plugin that throws at load is skipped and OpenCode carries on.
+    process.stderr.write(`${AGENT_SPAWN_REFUSAL}\n`);
+    process.exit(78);
+  }
   // An opencode config the guard cannot read makes the launder floor fail closed
   // (it then judges every command as natively allowed). That must not be silent:
   // it means the guard and opencode no longer agree on what runs unprompted.
@@ -718,8 +724,23 @@ const modeFor = async (sessionID) => {
       };
     },
 
+    // Every shell an agent session runs is marked (see AGENT_SHELL_ENV). The hook carries a
+    // sessionID only for a session's own shell calls; the user's PTY panes get none and stay
+    // unmarked, so a person can still start OpenCode from a terminal inside the TUI.
+    "shell.env": async (input, output) => {
+      if (!input?.sessionID) return;
+      output.env = { ...output.env, [AGENT_SHELL_ENV]: "1" };
+    },
+
     "tool.execute.before": async (input, output) => {
       const command = commandUnder(input?.tool, output?.args);
+      // Above every mode and level, god and off included: this is not a safety floor a person
+      // can lower for a session, it is what a session is. See AGENT_SHELL_ENV.
+      const spawnRoute = agentSpawnRefusal(command);
+      if (spawnRoute) {
+        log(`deny(${input?.tool ?? "?"}/agent-spawn)`, command);
+        throw new Error(`${AGENT_SPAWN_REFUSAL} Refused route: ${spawnRoute}.`);
+      }
       let mode;
       // Mode resolution can walk a subagent's ancestry and read each ancestor's
       // mode file. Keep one answer for this tool call, but do not retain a failed

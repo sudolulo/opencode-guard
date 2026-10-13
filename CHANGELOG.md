@@ -7,6 +7,12 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-10-13
+
+### Fixed
+
+- God-mode action permissions no longer wait for approval when a local/private profile has no available classifier lane. Decision questions still require the user's answer.
+
 ## [1.8.0] — 2026-10-09
 
 ### Changed

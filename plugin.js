@@ -1091,9 +1091,10 @@ const modeFor = async (sessionID) => {
       const parentID = ownMode ? null : (await infoFor(p.sessionID))?.parentID;
       const delegated = !ownMode && !!parentID;
       // A privacy profile with no local classifier stands aside entirely: nothing
-      // is approved on its behalf, and every prompt stays with the person.
-      const route = await routeFor(p.sessionID);
-      if (route.localOnly && !route.lanes.length) return;
+      // is approved on its behalf, and every prompt stays with the person. God has
+      // no classifier decision to make, so its approval cannot depend on that route.
+      const route = currentMode === "god" ? null : await routeFor(p.sessionID);
+      if (route?.localOnly && !route.lanes.length) return;
       if (handled.has(p.id)) return;
       handled.add(p.id);
       if (handled.size > 500) handled.clear();

@@ -8,7 +8,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const raise = ({ mode, command = "npm run build", permission = "bash", answer = "SAFE" }) => {
+const raise = ({
+  mode,
+  command = "npm run build",
+  permission = "bash",
+  answer = "SAFE",
+  profile,
+  repeat = 1,
+}) => {
   const home = mkdtempSync(join(tmpdir(), "guard-permission-"));
   try {
     mkdirSync(join(home, ".config/opencode"), { recursive: true });
@@ -16,6 +23,11 @@ const raise = ({ mode, command = "npm run build", permission = "bash", answer = 
     writeFileSync(join(home, ".config/opencode/classifier.json"),
       JSON.stringify({ url: "http://classifier.invalid/v1/chat/completions" }));
     writeFileSync(join(home, ".local/share/opencode/modes/ses_a"), `${mode}\n`);
+    if (profile) {
+      const profiles = join(home, ".local/share/opencode/model-routing/profiles");
+      mkdirSync(profiles, { recursive: true });
+      writeFileSync(join(profiles, "ses_a.json"), JSON.stringify({ profile, explicit: true }));
+    }
     const pluginUrl = new URL("../plugin.js", import.meta.url).href;
     const script = `
       const classified = [];
@@ -30,14 +42,16 @@ const raise = ({ mode, command = "npm run build", permission = "bash", answer = 
       };
       const { OpencodeGuard } = await import(${JSON.stringify(pluginUrl)});
       const hooks = await OpencodeGuard({ client, directory: "/work" });
-      await hooks.event({ event: { type: "permission.asked", properties: {
-        id: "per_1", sessionID: "ses_a", permission: ${JSON.stringify(permission)},
-        metadata: { command: ${JSON.stringify(command)} },
-      } } });
+      for (let i = 0; i < ${JSON.stringify(repeat)}; i++) {
+        await hooks.event({ event: { type: "permission.asked", properties: {
+          id: "per_1", sessionID: "ses_a", permission: ${JSON.stringify(permission)},
+          metadata: { command: ${JSON.stringify(command)} },
+        } } });
+      }
       console.log(JSON.stringify({ classified, replies }));
     `;
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", script],
-      { env: { ...process.env, HOME: home, OPENCODE_GUARD_CONFIG: "" }, encoding: "utf8" });
+      { env: { ...process.env, HOME: home, OPENCODE: "", OPENCODE_PID: "", OPENCODE_AGENT_SHELL: "", OPENCODE_GUARD_CONFIG: "" }, encoding: "utf8" });
     assert.equal(child.status, 0, child.stderr);
     return JSON.parse(child.stdout.trim().split("\n").at(-1));
   } finally {
@@ -77,6 +91,36 @@ test("auto mode asks the classifier and acts on its answer", () => {
 
 test("auto mode settles a static read without a model call", () => {
   const { classified, replies } = raise({ mode: "auto", command: "git status" });
+  assert.deepEqual(classified, []);
+  assert.deepEqual(replies, ["once"]);
+});
+
+test("god mode approves permissions even when a local profile has no classifier lane", () => {
+  for (const [permission, command] of [
+    ["bash", "npm run build"],
+    ["edit", undefined],
+    ["external_directory", undefined],
+  ]) {
+    const { classified, replies } = raise({ mode: "god", permission, command, profile: "local" });
+    assert.deepEqual(classified, [], `${permission} must not call the unavailable classifier`);
+    assert.deepEqual(replies, ["once"], `${permission} must be approved without a classifier lane`);
+  }
+});
+
+test("god mode leaves questions unanswered even when a local profile has no classifier lane", () => {
+  const { classified, replies } = raise({ mode: "god", permission: "question", command: undefined, profile: "local" });
+  assert.deepEqual(classified, []);
+  assert.deepEqual(replies, []);
+});
+
+test("auto mode keeps a restricted no-lane permission prompt unanswered", () => {
+  const { classified, replies } = raise({ mode: "auto", profile: "local" });
+  assert.deepEqual(classified, []);
+  assert.deepEqual(replies, []);
+});
+
+test("a duplicate god permission event receives one reply", () => {
+  const { classified, replies } = raise({ mode: "god", profile: "local", repeat: 2 });
   assert.deepEqual(classified, []);
   assert.deepEqual(replies, ["once"]);
 });

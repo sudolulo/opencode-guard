@@ -86,6 +86,31 @@ test("readSession tells a session that does not exist from a lookup that failed"
   assert.ok(noData instanceof T.TreeLookupError, "a reply without a session record is a failure, never a root");
 });
 
+test("readSession requires the record to be the requested session and parentID to be a real id", async () => {
+  for (const [label, data] of [
+    ["no id", {}],
+    ["mismatched id", { id: "ses_other" }],
+    ["array record", [{ id: "ses_x" }]],
+    ["numeric parentID", { id: "ses_x", parentID: 7 }],
+    ["empty parentID", { id: "ses_x", parentID: "" }],
+    ["object parentID", { id: "ses_x", parentID: { id: "ses_root" } }],
+  ]) {
+    let calls = 0;
+    const tree = T.createSessionTree({
+      client: { session: { get: async () => { calls += 1; return { data, response: { status: 200 } }; } } }, directory: "/work",
+    });
+    const error = await tree.readSession("ses_x").catch((e) => e);
+    assert.ok(error instanceof T.TreeLookupError, label);
+    assert.equal(error.missing, false, `${label} is a failed lookup, not proof of absence`);
+    await tree.parentOf("ses_x").catch(() => {});
+    assert.equal(calls, 2, `${label} must never be cached as a parent link`);
+  }
+  for (const [data, parentID] of [[{ id: "ses_x" }, null], [{ id: "ses_x", parentID: null }, null], [{ id: "ses_x", parentID: "ses_root" }, "ses_root"]]) {
+    const tree = T.createSessionTree({ client: { session: { get: async () => ({ data, response: { status: 200 } }) } }, directory: "/work" });
+    assert.deepEqual(await tree.readSession("ses_x"), { parentID }, JSON.stringify(data));
+  }
+});
+
 test("readSession retries one transient failure but not a missing session", async () => {
   const reply = (status) => status === 200
     ? { data: { id: "ses_x" }, response: { status } }
@@ -120,6 +145,33 @@ test("ancestry walks parent links to the root and remembers them", async () => {
   assert.equal(calls.length, 3, "each session is read once: parentID never changes");
   assert.equal(await tree.parentOf("ses_mid"), "ses_root");
   assert.equal(calls.length, 3);
+});
+
+test("forgetting a deleted session makes a same-ID recreation read its new parent", async () => {
+  const sessions = { ses_root_a: null, ses_root_b: null, ses_reused: "ses_root_a" };
+  const { client, calls } = fakeClient({ sessions });
+  const tree = T.createSessionTree({ client, directory: "/work" });
+  assert.deepEqual(await tree.ancestry("ses_reused"), ["ses_reused", "ses_root_a"]);
+  delete sessions.ses_reused;
+  sessions.ses_reused = "ses_root_b";
+  tree.forget("ses_reused");
+  assert.deepEqual(await tree.ancestry("ses_reused"), ["ses_reused", "ses_root_b"]);
+  assert.equal(calls.filter((call) => call.op === "get" && call.id === "ses_reused").length, 2,
+    "the recreated ID is read again instead of retaining its deleted row's parent");
+});
+
+test("knownParent is a synchronous cache read: parent, null for a root, undefined when unknown", async () => {
+  const { client, calls } = fakeClient({ sessions: { ses_root: null, ses_kid: "ses_root" } });
+  const tree = T.createSessionTree({ client, directory: "/work" });
+  assert.equal(tree.knownParent("ses_kid"), undefined, "nothing read yet");
+  await tree.ancestry("ses_kid");
+  const before = calls.length;
+  assert.equal(tree.knownParent("ses_kid"), "ses_root");
+  assert.equal(tree.knownParent("ses_root"), null);
+  assert.equal(tree.knownParent("ses_other"), undefined);
+  assert.equal(calls.length, before, "a known-parent read never reaches the host");
+  tree.forget("ses_kid");
+  assert.equal(tree.knownParent("ses_kid"), undefined);
 });
 
 test("an ancestry that loops, runs too deep or loses a parent is a failed lookup", async () => {

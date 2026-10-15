@@ -7,6 +7,19 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-10-15
+
+### Changed
+
+- **God escalation policy (2026-10-14 design).** Refusals are routed instead of failing silently. A god root's own visible-tool requests are allowed through a logged native `override: "root"`. A god descendant's refusals, including guard floors deferred from `tool.execute.before` to the call's own permission hook, become one exact parent ask (once/reject, never Always, never a person). Auto descendants are judged as the root would be: a named ROOT bash deny goes to the human once, and a ROOT catch-all deny stands. Requires a host reporting `permissionAuthority: 2`; old hosts keep the earlier behaviour, and unknown or failed capability transport fails closed.
+- A descendant's plain native ask is judged by the ROOT's mode. A child's own mode file no longer loosens it.
+
+### Fixed
+
+- A deferred floor's slot is freed when its call fails before reaching the permission hook (native now marks `tool.execute.after` as `failed`), instead of being held until restart.
+- A call whose root left or entered god mode after it began is denied, not given the earlier mode's verdict.
+- Every call binds its root incarnation before any asynchronous floor work. A replaced or aborted root never inherits a call's escalation, and a binding failure refuses the call.
+
 ## [1.8.1] — 2026-10-13
 
 ### Fixed

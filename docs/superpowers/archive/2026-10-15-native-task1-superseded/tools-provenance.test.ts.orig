@@ -1,0 +1,108 @@
+import { test, expect } from "bun:test"
+import { Effect, Layer, Schema } from "effect"
+import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { Agent } from "../../src/agent/agent"
+import { MCP } from "../../src/mcp"
+import { Permission } from "../../src/permission"
+import { Plugin } from "../../src/plugin"
+import { RuntimeFlags } from "../../src/effect/runtime-flags"
+import { SessionTools } from "../../src/session/tools"
+import { ToolRegistry } from "../../src/tool/registry"
+import * as Truncate from "../../src/tool/truncate"
+import { MessageID, SessionID } from "../../src/session/schema"
+
+// Drives the real SessionTools.resolve ask path: the agent's trusted provenance must reach
+// Permission.prepareForRequest, so an exec seat's tools-availability catch-all can become the
+// parent ask the hook proposes. Permission.ask is captured instead of run.
+
+const ROOT = SessionID.make("ses_tools_root")
+const CHILD = SessionID.make("ses_tools_child")
+
+const rule = (permission: string, pattern: string, action: "allow" | "deny" | "ask"): PermissionV1.Rule => ({
+  permission,
+  pattern,
+  action,
+})
+const agentRules = [rule("*", "*", "allow"), rule("*", "*", "deny"), rule("bash", "go test *", "allow")]
+const agent = { name: "tester", mode: "subagent", options: {}, permission: agentRules } as unknown as Agent.Info
+
+const run = (
+  provenance: Permission.AgentProvenance | ((agentID: string) => Permission.AgentProvenance | undefined) | undefined,
+  currentAgent = agent,
+) => {
+  const asked: Parameters<Permission.Interface["ask"]>[0][] = []
+  const probe = {
+    id: "probe",
+    description: "asks for a bash command",
+    parameters: Schema.Struct({}),
+    execute: (_args: unknown, ctx: { ask: (req: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">) => Effect.Effect<void> }) =>
+      ctx
+        .ask({ permission: "bash", patterns: ["./check-gates.sh"], always: ["./check-gates.sh"], metadata: {} })
+        .pipe(Effect.as({ title: "", metadata: {}, output: "ok" })),
+  }
+  const layer = Layer.mergeAll(
+    Layer.mock(Plugin.Service, {
+      trigger: ((name: string, _input: unknown, output: unknown) =>
+        Effect.succeed(
+          name === "permission.ask"
+            ? { status: "ask", approval: { kind: "parent", sessionID: ROOT }, forceAsk: true }
+            : output,
+        )) as unknown as Plugin.Interface["trigger"],
+    }),
+    Layer.mock(Permission.Service, {
+      ask: (input) => Effect.sync(() => void asked.push(input)),
+    }),
+    Layer.mock(ToolRegistry.Service, { tools: () => Effect.succeed([probe as never]) }),
+    Layer.mock(MCP.Service, { clients: () => Effect.succeed({}), tools: () => Effect.succeed({}) }),
+    Layer.mock(Truncate.Service, {}),
+    Layer.mock(Agent.Service, {
+      permissionContext: (agentID) => Effect.succeed(typeof provenance === "function" ? provenance(agentID) : provenance),
+    }),
+    RuntimeFlags.layer({}),
+  )
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const tools = yield* SessionTools.resolve(
+        Object.assign(
+          {
+            agent: currentAgent,
+            model: { id: "m", providerID: "test", api: { id: "m", npm: "@ai-sdk/openai-compatible" } } as never,
+            session: { id: CHILD, parentID: ROOT, permission: [] } as never,
+            processor: { message: { id: MessageID.make("msg_tools") } } as never,
+            bypassAgentCheck: false,
+            messages: [],
+            promptOps: {} as never,
+            lookupSession: ((id: SessionID) => Effect.succeed({ id, permission: [] })) as never,
+          },
+          { agentID: "tester" },
+        ),
+      )
+      yield* Effect.promise(() =>
+        Promise.resolve(tools.probe.execute!({}, { toolCallId: "call_probe", messages: [], abortSignal: new AbortController().signal })),
+      )
+      return asked
+    }).pipe(Effect.provide(layer)),
+  )
+}
+
+test("resolve hands the agent's provenance to request preparation", async () => {
+  const [asked] = await run({ capability: "exec", rules: agentRules, availability: new Set([1]), globalPolicy: new Set() })
+  expect(Permission.evaluate("bash", "./check-gates.sh", asked.ruleset).action).toBe("ask")
+  expect(asked.approval).toEqual({ kind: "parent", sessionID: ROOT })
+  expect(asked.forceAsk).toBe(true)
+  expect(asked.always).toEqual([])
+})
+
+test("resolve without provenance keeps the catch-all deny", async () => {
+  const [asked] = await run(undefined)
+  expect(Permission.evaluate("bash", "./check-gates.sh", asked.ruleset).action).toBe("deny")
+  expect(asked.approval).toBeUndefined()
+})
+
+test("resolve looks up provenance by the selected agent key, not its display name", async () => {
+  const execProvenance = { capability: "exec", rules: agentRules, availability: new Set([1]), globalPolicy: new Set<number>() }
+  const readProvenance = { capability: "read", rules: agentRules, availability: new Set([1]), globalPolicy: new Set<number>() }
+  const displayCollision = { ...agent, name: "reader" } as Agent.Info
+  const [asked] = await run((agentID) => (agentID === "tester" ? execProvenance : readProvenance), displayCollision)
+  expect(Permission.evaluate("bash", "./check-gates.sh", asked.ruleset).action).toBe("ask")
+})

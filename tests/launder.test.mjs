@@ -212,8 +212,19 @@ const runHook = ({ mode, command, config, agent, agents, agentsFail, events }) =
       const logs = [];
       const agents = ${JSON.stringify(agents ?? null)};
       const agentsFail = ${JSON.stringify(Boolean(agentsFail))};
+      // An explicit old host (permissionAuthority 1): these cases pin the legacy floor. A
+      // missing transport is no longer an old host; it fails closed.
+      const oldHost = async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const body = new URL(request.url).pathname === "/experimental/capabilities"
+          ? [{ permissionAuthority: 1, backgroundSubagents: true }, 200] : [{ name: "NotFoundError" }, 404];
+        return new Response(JSON.stringify(body[0]), { status: body[1], headers: { "content-type": "application/json" } });
+      };
       const client = {
-        session: { status: async () => ({ data: { ses_a: { type: "busy" } } }), get: async () => ({ data: {} }) },
+        session: {
+          _client: { getConfig: () => ({ baseUrl: "http://opencode.invalid", fetch: oldHost, headers: new Headers() }) },
+          status: async () => ({ data: { ses_a: { type: "busy" } } }), get: async () => ({ data: {} }),
+        },
         app: {
           log: async (entry) => { logs.push(entry?.body ?? entry); },
           agents: async () => { if (agentsFail) throw new Error("server away"); return { data: agents ?? [] }; },
@@ -231,7 +242,9 @@ const runHook = ({ mode, command, config, agent, agents, agentsFail, events }) =
       console.log(JSON.stringify({ outcome, logs }));
     `;
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-      env: { ...process.env, HOME: h }, encoding: "utf8",
+      // This is an inline fake-client Node host, not an OpenCode or agent launch.
+      // Keep the real agent-shell refusal test separate; do not inherit its marker.
+      env: { ...process.env, HOME: h, OPENCODE_AGENT_SHELL: "" }, encoding: "utf8",
     });
     assert.equal(child.status, 0, child.stderr);
     const result = JSON.parse(child.stdout.trim().split("\n").at(-1));
@@ -241,7 +254,7 @@ const runHook = ({ mode, command, config, agent, agents, agentsFail, events }) =
   }
 };
 
-test("a config deny rule holds in god mode, where an Always approval could otherwise override it", () => {
+test("old host: a config deny rule holds in god mode, where an Always approval could otherwise override it", () => {
   assert.match(runHook({ mode: "god", command: "rm -rf /etc" }), /matches a deny rule/);
   assert.match(runHook({ mode: "god", command: "snip rm -rf /etc" }), /matches a deny rule/);
   assert.equal(runHook({ mode: "god", command: "echo x > /home/dev/.bashrc" }), "ran", "god still lifts the launder floor");
@@ -338,6 +351,19 @@ test("configDenyReason applies the config's deny rules to every command node", (
   assert.ok(P.configDenyReason("ls && (rm -rf /etc)", rules));
   assert.equal(P.configDenyReason("ls -la", rules), null);
   assert.equal(P.configDenyReason("git push origin x", rules), null, "ask is not deny");
+});
+
+test("configDenyReason leaves directory commands to native directory permissions", () => {
+  const seatRules = P.bashRulesFromRuleset([
+    { permission: "bash", pattern: "*", action: "deny" },
+    { permission: "bash", pattern: "node --test*", action: "allow" },
+  ]);
+  assert.equal(P.configDenyReason("cd /x && node --test tests/*.mjs", seatRules), null);
+  assert.equal(P.configDenyReason("snip cd /x && node --test a", seatRules), null);
+  assert.ok(P.configDenyReason("cd /x && rm -rf /etc", seatRules));
+  assert.ok(P.configDenyReason("cd $(rm -rf /etc)", seatRules));
+  assert.equal(P.configDenyReason("pushd /x && node --test a", seatRules), null);
+  assert.ok(P.configDenyReason("ls", seatRules));
 });
 
 test("blanketAlwaysPattern spots the approvals that cover far more than one command", () => {

@@ -166,41 +166,54 @@ test("duplicate real-session failure and forget reports do not extend the circui
     }, { dir: brokerDir });
     assert.equal(published.accepted, true);
 
-    const created = [];
-    let firstFailure = null;
-    let firstTargetID = null;
-    const embeddedFetch = async (input, init) => {
-      const request = input instanceof Request ? input : new Request(input, init);
-      const bodyText = await request.text();
-      const body = bodyText ? JSON.parse(bodyText) : {};
-      const sessionID = `ses_classifier_${created.length + 1}`;
-      created.push({ body, sessionID });
-      return new Response(JSON.stringify({ data: { id: sessionID } }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    };
-    const client = {
-      session: {
+    // The test runner inherits OPENCODE_AGENT_SHELL from the harness. This inline
+    // Node fake-client fixture launches neither OpenCode nor an agent; isolate only
+    // its environment. The real broker service still inherits the marker unchanged,
+    // and the plugin's production process-level refusal remains intact.
+    const helperUrl = new URL("../lib/broker.js", import.meta.url).href;
+    const pluginUrl = new URL("../plugin.js", import.meta.url).href;
+    const fakeHost = `
+      const B = await import(${JSON.stringify(helperUrl)});
+      const { OpencodeGuard } = await import(${JSON.stringify(pluginUrl)});
+       const brokerDir = ${JSON.stringify(brokerDir)};
+       const created = [];
+       const cleanup = [];
+      let firstFailure = null;
+      let firstTargetID = null;
+      const embeddedFetch = async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+         const bodyText = await request.text();
+         const body = bodyText ? JSON.parse(bodyText) : {};
+         if (new URL(request.url).pathname.endsWith("/experimental/capabilities")) {
+            return new Response(JSON.stringify({ data: { permissionAuthority: 2, backgroundSubagents: true, sessionIncarnation: 1 } }), {
+             status: 200, headers: { "content-type": "application/json" },
+           });
+         }
+         // A session read (the permission handler resolving whether the asker has a parent) is
+         // not a create: answer it as a parentless session without counting it.
+         if (request.method === "GET") {
+           return new Response(JSON.stringify({ data: { id: new URL(request.url).pathname.split("/").pop() } }), {
+             status: 200, headers: { "content-type": "application/json" },
+           });
+         }
+         const sessionID = \`ses_classifier_\${created.length + 1}\`;
+         const incarnationID = \`inc_classifier_\${created.length + 1}\`;
+         created.push({ body, sessionID, incarnationID });
+         return new Response(JSON.stringify({ data: { id: sessionID, incarnationID } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      };
+      const client = { session: {
         _client: { getConfig: () => ({ baseUrl: "http://opencode.invalid", fetch: embeddedFetch, headers: new Headers() }) },
         prompt: async (request) => {
           const sessionID = request.path.id;
           const lease = await B.brokerRequest("/lease", {
-            sessionID,
-            profile: "auto",
-            tier: "classifier",
-            contextTokens: 100,
-            replace: true,
+            sessionID, profile: "auto", tier: "classifier", contextTokens: 100, replace: true,
           }, { dir: brokerDir });
           if (!firstFailure) {
             firstTargetID = lease.target.id;
-            // The router's own report, as the router makes it: with the broker-minted
-            // leaseID, which every settlement call has required since opencode-broker
-            // secured its lease bindings.
             firstFailure = await B.brokerRequest("/failure", {
-              sessionID,
-              leaseID: lease.leaseID,
-              targetID: firstTargetID,
+              sessionID, leaseID: lease.leaseID, targetID: firstTargetID,
               error: { statusCode: 503, message: "provider exploded" },
             }, { dir: brokerDir });
             await new Promise((resolve) => setTimeout(resolve, 25));
@@ -208,20 +221,35 @@ test("duplicate real-session failure and forget reports do not extend the circui
           }
           return { data: { parts: [{ type: "text", text: "SAFE" }] } };
         },
-        abort: async () => {},
-        status: async () => ({ data: {} }),
-        delete: async (request) => {
-          await B.brokerRequest("/forget", { sessionID: request.path.id }, { dir: brokerDir });
-        },
-      },
-      postSessionIdPermissionsPermissionId: async () => ({}),
-    };
-    const { OpencodeGuard } = await import("../plugin.js");
-    const hooks = await OpencodeGuard({ client, directory: "/work" });
-    await hooks.event({ event: { type: "permission.asked", properties: {
-      id: "per_classifier", sessionID: "ses_parent", permission: "bash",
-      metadata: { command: "npm run build" },
-    } } });
+         abort: async (request) => { cleanup.push({ op: "abort", query: request.query }); }, status: async () => ({ data: {} }),
+         delete: async (request) => {
+           cleanup.push({ op: "delete", query: request.query });
+           return B.brokerRequest("/forget", { sessionID: request.path.id }, { dir: brokerDir });
+         },
+      }, postSessionIdPermissionsPermissionId: async () => ({}) };
+      const hooks = await OpencodeGuard({ client, directory: "/work" });
+      await hooks.event({ event: { type: "permission.asked", properties: {
+        id: "per_classifier", sessionID: "ses_parent", permission: "bash",
+        metadata: { command: "npm run build" },
+      } } });
+       process.stdout.write(JSON.stringify({ created, cleanup, firstFailure, firstTargetID }));
+    `;
+    const fakeHostChild = await new Promise((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      const child = spawn(process.execPath, ["--input-type=module", "-e", fakeHost], {
+        env: { ...process.env, OPENCODE_AGENT_SHELL: "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      child.once("error", reject);
+      child.once("exit", (code, signal) => {
+        if (code === 0) resolve({ stdout, stderr });
+        else reject(new Error(`fake embedded host exited (${code ?? signal}): ${stderr}`));
+      });
+    });
+    const { created, cleanup, firstFailure, firstTargetID } = JSON.parse(fakeHostChild.stdout);
 
     const status = await B.brokerRequest("/status", {}, { dir: brokerDir });
     assert.equal(status.leases[created[0].sessionID], undefined, "the real-session lease is gone");
@@ -230,6 +258,10 @@ test("duplicate real-session failure and forget reports do not extend the circui
     // refuses a settlement without the broker-minted leaseID; a guard that sent only the
     // sessionID leaked every classifier lease until the idle reaper took it.
     assert.equal(created.length, 2, "the failed classification was retried once");
+    assert.deepEqual(cleanup, created.flatMap(({ incarnationID }) => [
+      { op: "abort", query: { directory: "/work", incarnationID } },
+      { op: "delete", query: { directory: "/work", incarnationID } },
+    ]), "owned classifier cleanup is bound to each native session incarnation");
     assert.equal(status.leases[created[1].sessionID], undefined, "the guard's own /forget settled the retry's lease");
     assert.equal(Date.parse(status.circuits[firstTargetID].renewsAt), firstFailure.circuitUntil,
       "the guard's duplicate failure report cannot extend the router's circuit");

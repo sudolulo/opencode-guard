@@ -48,8 +48,17 @@ const run = ({ sessions = {}, messages = {}, modes = {}, globalMode, level, getF
       const gets = [];
       const pages = [];
       const replies = [];
+      // An explicit old host (permissionAuthority 1): the tree rules and G3 are pinned on the
+      // legacy path. A missing transport is no longer an old host; it fails closed.
+      const oldHost = async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const body = new URL(request.url).pathname === "/experimental/capabilities"
+          ? [{ permissionAuthority: 1, backgroundSubagents: true }, 200] : [{ name: "NotFoundError" }, 404];
+        return new Response(JSON.stringify(body[0]), { status: body[1], headers: { "content-type": "application/json" } });
+      };
       const client = {
         session: {
+          _client: { getConfig: () => ({ baseUrl: "http://opencode.invalid", fetch: oldHost, headers: new Headers() }) },
           status: async () => ({ data: Object.fromEntries(Object.keys(sessions).map((id) => [id, { type: "busy" }])) }),
           get: async (options) => {
             const id = options?.path?.id;
@@ -72,7 +81,31 @@ const run = ({ sessions = {}, messages = {}, modes = {}, globalMode, level, getF
       const hooks = await OpencodeGuard({ client, directory: "/work" });
       const outcomes = [];
       for (const step of ${JSON.stringify(steps)}) {
-        if (step.event) { await hooks.event({ event: step.event }); continue; }
+        if (step.recreate) {
+          sessions[step.recreate.id] = step.recreate.parentID;
+          continue;
+        }
+        if (step.event) {
+          if (step.event.rejectApprovalNotifier) {
+            let infoReads = 0;
+            const event = {
+              type: "session.deleted",
+              properties: {
+                get info() {
+                  infoReads += 1;
+                  // The production eviction reads this first. The approval notifier
+                  // reads it next and rejects; later notifier reads still work.
+                  if (infoReads === 2) throw new Error("approval notifier rejected");
+                  return { id: step.event.sessionID };
+                },
+              },
+            };
+            await hooks.event({ event });
+          } else {
+            await hooks.event({ event: step.event });
+          }
+          continue;
+        }
         if (step.permission) {
           await hooks.event({ event: { type: "permission.asked", properties: {
             id: "per_" + outcomes.length, sessionID: step.sessionID, permission: step.permission,
@@ -95,7 +128,8 @@ const run = ({ sessions = {}, messages = {}, modes = {}, globalMode, level, getF
       ? ["--import", pathToFileURL(counter).href, "--input-type=module", "-e", script]
       : ["--input-type=module", "-e", script];
     const child = spawnSync(process.execPath, args, {
-      env: { ...process.env, HOME: home, OPENCODE_GUARD_CONFIG: "" }, encoding: "utf8", timeout: 20_000,
+      // This inline fake-client Node host is not an OpenCode or agent launch.
+      env: { ...process.env, HOME: home, OPENCODE_GUARD_CONFIG: "", OPENCODE_AGENT_SHELL: "" }, encoding: "utf8", timeout: 20_000,
     });
     assert.equal(child.status, 0, child.stderr || child.error?.message);
     return JSON.parse(child.stdout.trim().split("\n").at(-1));
@@ -125,6 +159,37 @@ test("G3: a session with its own mode file looks nothing up", () => {
     steps: [{ tool: "read", sessionID: "ses_root", args: { filePath: "/work/a" } }] });
   assert.deepEqual(result.outcomes, ["ran"]);
   assert.deepEqual(result.gets, []);
+});
+
+test("session.deleted evicts a reused session ID before its next ancestry read", () => {
+  const result = run({
+    sessions: { ses_root_a: null, ses_root_b: null, ses_reused: "ses_root_a" }, globalMode: "auto",
+    steps: [
+      { tool: "read", sessionID: "ses_reused", args: { filePath: "/work/a" } },
+      { recreate: { id: "ses_reused", parentID: "ses_root_b" } },
+      { event: { type: "session.deleted", properties: { info: { id: "ses_reused" } } } },
+      { tool: "read", sessionID: "ses_reused", args: { filePath: "/work/a" } },
+    ],
+  });
+  assert.deepEqual(result.outcomes, ["ran", "ran"]);
+  assert.equal(result.gets.filter((id) => id === "ses_reused").length, 2,
+    "the recreated row is fetched after its deletion event");
+  assert.ok(result.gets.includes("ses_root_b"), "the second ancestry follows the recreated row's parent");
+});
+
+test("session.deleted evicts a reused ID when approval notification rejects", () => {
+  const result = run({
+    sessions: { ses_root_a: null, ses_root_b: null, ses_reused: "ses_root_a" }, globalMode: "auto",
+    steps: [
+      { tool: "read", sessionID: "ses_reused", args: { filePath: "/work/a" } },
+      { recreate: { id: "ses_reused", parentID: "ses_root_b" } },
+      { event: { rejectApprovalNotifier: true, sessionID: "ses_reused" } },
+      { tool: "read", sessionID: "ses_reused", args: { filePath: "/work/a" } },
+    ],
+  });
+  assert.equal(result.gets.filter((id) => id === "ses_reused").length, 2,
+    "the recreated row is fetched even after the approval notifier rejects");
+  assert.ok(result.gets.includes("ses_root_b"), "the second ancestry follows the recreated row's parent");
 });
 
 test("G3: one subagent tool call walks inherited mode files once", () => {

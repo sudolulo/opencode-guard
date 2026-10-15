@@ -1,0 +1,246 @@
+diff --git a/packages/opencode/src/agent/agent.ts b/packages/opencode/src/agent/agent.ts
+index 536a642fe..54c64f6e1 100644
+--- a/packages/opencode/src/agent/agent.ts
++++ b/packages/opencode/src/agent/agent.ts
+@@ -1,5 +1,6 @@
+ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
++import { ConfigAgentOrigin } from "@opencode-ai/core/v1/config/agent-origin"
+ import { Config } from "@/config/config"
+ import { serviceUse } from "@opencode-ai/core/effect/service-use"
+ import { Provider } from "@/provider/provider"
+@@ -66,6 +67,12 @@ export interface Interface {
+   readonly list: () => Effect.Effect<Info[]>
+   readonly defaultInfo: () => Effect.Effect<Info>
+   readonly defaultAgent: () => Effect.Effect<string>
++  /**
++   * Trusted permission provenance for an agent, captured at construction before its config
++   * layers were flattened into `Info.permission`. Internal only: it is not part of `Info`, the
++   * SDK, or provider options. Undefined for an unknown agent.
++   */
++  readonly permissionContext: (agent: string) => Effect.Effect<Permission.AgentProvenance | undefined>
+   readonly generate: (input: {
+     description: string
+     model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+@@ -264,9 +271,23 @@ const layer = Layer.effect(
+           },
+         }
+ 
++        // Every built-in ends its initial merge with the user's global policy. Record that range
++        // before custom-agent policy or automatic allowances append more rules.
++        const globalPolicy = new Map<string, Set<number>>(
++          Object.entries(agents).map(([key, agent]) => [
++            key,
++            new Set(Array.from({ length: user.length }, (_, index) => agent.permission.length - user.length + index)),
++          ]),
++        )
++
++        // Indices into an agent's final ruleset of ALL rules that came from that agent's own
++        // legacy `tools` availability map rather than from explicit permission policy.
++        const availability = new Map<string, Set<number>>()
++
+         for (const [key, value] of Object.entries(cfg.agent ?? {})) {
+           if (value.disable) {
+             delete agents[key]
++            availability.delete(key)
+             continue
+           }
+           let item = agents[key]
+@@ -278,6 +299,7 @@ const layer = Layer.effect(
+               options: {},
+               native: false,
+             }
++            globalPolicy.set(key, new Set(Array.from({ length: user.length }, (_, index) => defaults.length + index)))
+           if (value.model) item.model = Provider.parseModel(value.model)
+           item.variant = value.variant ?? item.variant
+           item.prompt = value.prompt ?? item.prompt
+@@ -290,7 +312,18 @@ const layer = Layer.effect(
+           item.name = value.name ?? item.name
+           item.steps = value.steps ?? item.steps
+           item.options = mergeDeep(item.options, value.options ?? {})
+-          item.permission = Permission.merge(item.permission, Permission.fromConfig(value.permission ?? {}))
++          const explicit = Permission.fromConfig(value.permission ?? {})
++          const offset = item.permission.length
++          const fromTools = ConfigAgentOrigin.toolsRules(value.permission)
++          availability.set(
++            key,
++            new Set(
++              explicit.flatMap((rule, index) =>
++                fromTools.has(rule.permission) && rule.pattern === "*" ? [offset + index] : [],
++              ),
++            ),
++          )
++          item.permission = Permission.merge(item.permission, explicit)
+         }
+ 
+         // Ensure Truncate.GLOB is allowed unless explicitly configured
+@@ -309,10 +342,27 @@ const layer = Layer.effect(
+           )
+         }
+ 
++        // Snapshot after every rule is appended, so the indices above address the final ruleset.
++        const contexts = new Map<string, Permission.AgentProvenance>(
++          Object.entries(agents).map(([key, agent]) => [
++            key,
++            {
++              capability: typeof agent.options.capability === "string" ? agent.options.capability : undefined,
++              rules: agent.permission.map((rule) => ({ ...rule })),
++              availability: availability.get(key) ?? new Set<number>(),
++              globalPolicy: globalPolicy.get(key) ?? new Set<number>(),
++            },
++          ]),
++        )
++
+         const get = Effect.fnUntraced(function* (agent: string) {
+           return agents[agent]
+         })
+ 
++        const permissionContext = Effect.fnUntraced(function* (agent: string) {
++          return contexts.get(agent)
++        })
++
+         const list = Effect.fnUntraced(function* () {
+           const cfg = yield* config.get()
+           return pipe(
+@@ -348,6 +398,7 @@ const layer = Layer.effect(
+           list,
+           defaultInfo,
+           defaultAgent,
++          permissionContext,
+         } satisfies State
+       }),
+     )
+@@ -365,6 +416,9 @@ const layer = Layer.effect(
+       defaultAgent: Effect.fn("Agent.defaultAgent")(function* () {
+         return yield* InstanceState.useEffect(state, (s) => s.defaultAgent())
+       }),
++      permissionContext: Effect.fn("Agent.permissionContext")(function* (agent: string) {
++        return yield* InstanceState.useEffect(state, (s) => s.permissionContext(agent))
++      }),
+       generate: Effect.fn("Agent.generate")(function* (input: {
+         description: string
+         model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+diff --git a/packages/opencode/src/config/agent.ts b/packages/opencode/src/config/agent.ts
+index a74450ce0..7eb2a5746 100644
+--- a/packages/opencode/src/config/agent.ts
++++ b/packages/opencode/src/config/agent.ts
+@@ -4,6 +4,7 @@ import path from "path"
+ import { Exit, Schema } from "effect"
+ import { Glob } from "@opencode-ai/core/util/glob"
+ import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
++import { ConfigAgentOrigin } from "@opencode-ai/core/v1/config/agent-origin"
+ import { configEntryNameFromPath } from "./entry-name"
+ import * as ConfigMarkdown from "./markdown"
+ import { ConfigParse } from "./parse"
+@@ -47,8 +48,10 @@ export async function loadMode(dir: string) {
+       ...md.data,
+       prompt: md.content.trim(),
+     }
++    const attach = ConfigAgentOrigin.captureAgent(config)
+     const parsed = Schema.decodeUnknownExit(ConfigAgentV1.Info)(config, { errors: "all", propertyOrder: "original" })
+     if (Exit.isSuccess(parsed)) {
++      attach(parsed.value)
+       result[config.name] = {
+         ...parsed.value,
+         mode: "primary" as const,
+diff --git a/packages/opencode/src/config/config.ts b/packages/opencode/src/config/config.ts
+index 86238f1a8..f7b42f49e 100644
+--- a/packages/opencode/src/config/config.ts
++++ b/packages/opencode/src/config/config.ts
+@@ -27,6 +27,8 @@ import { RemoteAuthError } from "@opencode-ai/core/v1/config/error"
+ import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
+ import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
+ import { ConfigAgent } from "./agent"
++import { ConfigAgentOrigin } from "@opencode-ai/core/v1/config/agent-origin"
++import type { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
+ import { ConfigCommand } from "./command"
+ import { ConfigManaged } from "./managed"
+ import { ConfigParse } from "./parse"
+@@ -39,7 +41,27 @@ import { withTransientReadRetry } from "@/util/effect-http-client"
+ // Custom merge function that concatenates array fields instead of replacing them
+ // Keep remeda's deep conditional merge type out of hot config-loading paths; TS profiling showed it dominates here.
+ function mergeConfig(target: Info, source: Info): Info {
+-  return mergeDeep(target, source) as Info
++  const merged = mergeDeep(target, source) as Info
++  transferAgentOrigins(target.agent, source.agent, merged.agent)
++  transferAgentOrigins(target.mode, source.mode, merged.mode)
++  return merged
++}
++
++function transferAgentOrigins(
++  target: Record<string, ConfigAgentV1.Info> | undefined,
++  source: Record<string, ConfigAgentV1.Info> | undefined,
++  result: Record<string, ConfigAgentV1.Info> | undefined,
++) {
++  if (!isRecord(result)) return
++  for (const [key, agent] of Object.entries(result)) {
++    ConfigAgentOrigin.transfer(target?.[key]?.permission, source?.[key]?.permission, agent?.permission)
++  }
++}
++
++function mergeAgents(target: Record<string, ConfigAgentV1.Info>, source: Record<string, ConfigAgentV1.Info>) {
++  const merged = mergeDeep(target, source)
++  transferAgentOrigins(target, source, merged)
++  return merged
+ }
+ 
+ function mergeConfigConcatArrays(target: Info, source: Info): Info {
+@@ -457,8 +479,8 @@ const layer = Layer.effect(
+           deps.push(dep)
+ 
+           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
+-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
+-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
++          result.agent = mergeAgents(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
++          result.agent = mergeAgents(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
+           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
+           // returns normalized Specs and we only need to attach origin metadata here.
+           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
+@@ -534,7 +556,7 @@ const layer = Layer.effect(
+         }
+ 
+         for (const [name, mode] of Object.entries(result.mode ?? {})) {
+-          result.agent = mergeDeep(result.agent ?? {}, {
++          result.agent = mergeAgents(result.agent ?? {}, {
+             [name]: {
+               ...mode,
+               mode: "primary" as const,
+diff --git a/packages/opencode/src/config/parse.ts b/packages/opencode/src/config/parse.ts
+index 538f51131..2cb5f7e47 100644
+--- a/packages/opencode/src/config/parse.ts
++++ b/packages/opencode/src/config/parse.ts
+@@ -4,6 +4,9 @@ import { type ParseError as JsoncParseError, parse as parseJsoncImpl, printParse
+ import { Cause, Exit, Schema as EffectSchema, SchemaIssue } from "effect"
+ import type { DeepMutable } from "@opencode-ai/core/schema"
+ import { InvalidError, JsonError } from "@opencode-ai/core/v1/config/error"
++import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
++import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
++import { ConfigAgentOrigin } from "@opencode-ai/core/v1/config/agent-origin"
+ 
+ export function jsonc(text: string, filepath: string): unknown {
+   const errors: JsoncParseError[] = []
+@@ -37,12 +40,23 @@ export function schema<S extends EffectSchema.Decoder<unknown, never>>(
+   data: unknown,
+   source: string,
+ ): DeepMutable<S["Type"]> {
++  // Only trusted raw-config entry points can establish origin. Capture before normalization;
++  // attach after all schema clones. Serialized normalized policy is deliberately explicit.
++  const attach =
++    Object.is(schema, ConfigV1.Info)
++      ? ConfigAgentOrigin.captureConfig(data)
++      : Object.is(schema, ConfigAgentV1.Info)
++        ? ConfigAgentOrigin.captureAgent(data)
++        : undefined
+   const decoded = EffectSchema.decodeUnknownExit(schema)(data, {
+     errors: "all",
+     onExcessProperty: "ignore",
+     propertyOrder: "original",
+   })
+-  if (Exit.isSuccess(decoded)) return decoded.value as DeepMutable<S["Type"]>
++  if (Exit.isSuccess(decoded)) {
++    attach?.(decoded.value)
++    return decoded.value as DeepMutable<S["Type"]>
++  }
+   const error = Cause.squash(decoded.cause)
+ 
+   throw new InvalidError(

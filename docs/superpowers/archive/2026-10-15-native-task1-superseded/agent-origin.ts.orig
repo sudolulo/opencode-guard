@@ -1,0 +1,114 @@
+export * as ConfigAgentOrigin from "./agent-origin"
+
+type Permission = Readonly<Record<string, unknown>>
+
+// Internal only: no marker on config, Agent.Info, options, JSON or the SDK can assert origin.
+// Keying the permission object also preserves provenance across shallow agent/mode spreads.
+// core/config/plugin/agent's direct decoder feeds AgentV2, not native permissionContext: untracked here, fail-closed.
+// core/plugin/provider/opencode's direct decoder consumes provider config only: untracked here, fail-closed.
+const availability = new WeakMap<Permission, ReadonlyMap<string, unknown>>()
+// Keys where a tools-only overlay replaced explicit policy that denied anything. Sticky
+// across later tools-only overlays; only an explicit permission write for the key clears it.
+const tainted = new WeakMap<Permission, ReadonlySet<string>>()
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+// Snapshot raw inputs BEFORE schema normalization folds tools into explicit permission.
+// The returned sink is called only after successful decoding, against the final object:
+// Effect's structural validation clones both agent and permission objects internally.
+export function captureAgent(raw: unknown): (decoded: unknown) => void {
+  const tools = new Map<string, boolean>()
+  if (record(raw) && record(raw.tools)) {
+    for (const [key, enabled] of Object.entries(raw.tools)) {
+      if (typeof enabled !== "boolean") return () => {}
+      tools.set(key === "write" || key === "edit" || key === "patch" ? "edit" : key, enabled)
+    }
+  }
+  const explicit = record(raw) ? raw.permission : undefined
+  const policy = explicit === undefined ? [] : record(explicit) ? Object.keys(explicit) : ["*"]
+  const actions = new Map(
+    [...tools].filter(([key]) => !policy.includes(key)).map(([key, enabled]) => [key, enabled ? "allow" : "deny"]),
+  )
+  return (decoded) => {
+    if (!record(decoded) || !record(decoded.permission)) return
+    const permission = decoded.permission
+    availability.set(permission, new Map([...actions].filter(([key, action]) => permission[key] === action)))
+  }
+}
+
+export function captureConfig(raw: unknown): (decoded: unknown) => void {
+  const entries = ["agent", "mode"].flatMap((field) => {
+    const agents = record(raw) ? raw[field] : undefined
+    return record(agents)
+      ? Object.entries(agents).map(([key, value]) => ({ field, key, attach: captureAgent(value) }))
+      : []
+  })
+  return (decoded) => {
+    for (const { field, key, attach } of entries) {
+      const agents = record(decoded) ? decoded[field] : undefined
+      if (record(agents)) attach(agents[key])
+    }
+  }
+}
+
+export function toolsRules(permission: Permission | undefined): ReadonlySet<string> {
+  // Include allows as well as denies: request-time policy evaluation must remove BOTH,
+  // otherwise a tools allow could hide an earlier explicit role deny from that evaluation.
+  return new Set(
+    permission
+      ? [...(availability.get(permission) ?? [])].filter(([key, action]) => permission[key] === action).map(([key]) => key)
+      : [],
+  )
+}
+
+export function toolsDenies(permission: Permission | undefined): ReadonlySet<string> {
+  return new Set([...toolsRules(permission)].filter((key) => permission?.[key] === "deny"))
+}
+
+// Transfer alongside the existing deep merge, without changing its values or key order.
+// A tools-only overlay can never revoke an earlier explicit deny ceiling, however many
+// tools-only overlays follow: the key stays tainted (never availability origin) until an
+// explicit permission write for it replaces the policy normally, including allow/ask.
+// This tracks origin only: it is necessary but NOT sufficient for eligibility, which is
+// decided per requested pattern against the policy-only ruleset in catchAllDenied.
+export function transfer(
+  target: Permission | undefined,
+  source: Permission | undefined,
+  result: Permission | undefined,
+) {
+  // Remote config is also merged once BEFORE decoding; a valid raw permission may be
+  // a scalar action there. Only normalized permission objects can carry provenance.
+  if (!record(result)) return
+  const before = toolsRules(target)
+  const next = toolsRules(source)
+  const inherited = (target && tainted.get(target)) ?? new Set<string>()
+  // A source that is itself a merged permission (config mode -> agent) carries its own
+  // taint. Its value for the key is NOT an explicit write, so the taint must travel with
+  // it; this also covers target undefined, where result is the source object itself.
+  const carried = (source && tainted.get(source)) ?? new Set<string>()
+  const taint = new Set(
+    Object.keys(result).filter((key) => {
+      if (!source || !Object.hasOwn(source, key)) return inherited.has(key)
+      if (carried.has(key)) return true
+      // An explicit write replaces the old policy: no historical taint survives it.
+      if (!next.has(key)) return false
+      if (inherited.has(key)) return true
+      const previous = target?.[key]
+      // An explicit scalar deny replaced by a tools scalar.
+      if (previous === "deny") return !before.has(key)
+      // An object replaced by a tools scalar may contain a named role deny. Losing its
+      // shape is not permission to soften it; the replacement index stays fail-closed.
+      return record(previous) && Object.values(previous).includes("deny")
+    }),
+  )
+  const keys = Object.keys(result).filter((key) => {
+    if (result[key] !== "deny" && result[key] !== "allow") return false
+    if (taint.has(key)) return false
+    if (!source || !Object.hasOwn(source, key)) return before.has(key)
+    return next.has(key)
+  })
+  availability.set(result, new Map(keys.map((key) => [key, result[key]])))
+  tainted.set(result, taint)
+}

@@ -17,8 +17,17 @@ const run = ({ status, level } = {}) => {
     const script = `
       const statusCalls = [];
       const status = ${JSON.stringify(status ?? null)};
+      // An explicit old host (permissionAuthority 1): D0 is judged on the legacy path. A
+      // missing transport is no longer an old host; it fails closed.
+      const oldHost = async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const body = new URL(request.url).pathname === "/experimental/capabilities"
+          ? [{ permissionAuthority: 1, backgroundSubagents: true }, 200] : [{ name: "NotFoundError" }, 404];
+        return new Response(JSON.stringify(body[0]), { status: body[1], headers: { "content-type": "application/json" } });
+      };
       const client = {
         session: {
+          _client: { getConfig: () => ({ baseUrl: "http://opencode.invalid", fetch: oldHost, headers: new Headers() }) },
           status: async (options) => {
             statusCalls.push(options?.query?.directory ?? null);
             if (status === "throw") throw new Error("server away");
@@ -27,7 +36,7 @@ const run = ({ status, level } = {}) => {
           },
           // The real client always has session.get. ses_a has no mode file, so G3
           // reads its ancestry; here it is a root.
-          get: async () => ({ data: {} }),
+          get: async ({ path }) => ({ data: { id: path.id } }),
         },
         app: { log: async () => {} },
       };
@@ -39,7 +48,10 @@ const run = ({ status, level } = {}) => {
       } catch (error) { outcome = String(error?.message ?? error); }
       console.log(JSON.stringify({ outcome, statusCalls }));
     `;
-    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+    // This inline fake-client Node host is not an OpenCode or agent launch.
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, HOME: home, OPENCODE_AGENT_SHELL: "" }, encoding: "utf8",
+    });
     assert.equal(child.status, 0, child.stderr);
     return JSON.parse(child.stdout.trim().split("\n").at(-1));
   } finally {

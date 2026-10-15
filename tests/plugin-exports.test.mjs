@@ -50,6 +50,18 @@ const runRoutedClassifier = ({ busyCleanup = false, failFirst = false } = {}) =>
         const request = input instanceof Request ? input : new Request(input, init);
         const bodyText = await request.text();
         const body = bodyText ? JSON.parse(bodyText) : {};
+        if (new URL(request.url).pathname.endsWith("/experimental/capabilities")) {
+          return new Response(JSON.stringify({ data: {} }), {
+            status: 200, headers: { "content-type": "application/json" },
+          });
+        }
+        // A session read (the permission handler resolving whether the asker has a parent) is
+        // not a create: answer it as a parentless session without counting it.
+        if (request.method === "GET") {
+          return new Response(JSON.stringify({ data: { id: new URL(request.url).pathname.split("/").pop() } }), {
+            status: 200, headers: { "content-type": "application/json" },
+          });
+        }
         const sessionID = "ses_classifier_" + (++createCount);
         created.push({ body, sessionID });
         return new Response(JSON.stringify({ data: { id: sessionID } }), {
@@ -105,7 +117,8 @@ const runRoutedClassifier = ({ busyCleanup = false, failFirst = false } = {}) =>
       process.stdout.write(JSON.stringify({ calls, created, prompts, aborts, deletes, statusCount, error, noThink, ordinary, cloud }));
     `;
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-      env: { ...process.env, HOME: home, OPENCODE_GUARD_CONFIG: "" },
+      // This inline fake-client Node host is not an OpenCode or agent launch.
+      env: { ...process.env, HOME: home, OPENCODE_GUARD_CONFIG: "", OPENCODE_AGENT_SHELL: "" },
       encoding: "utf8",
       timeout: 10_000,
     });

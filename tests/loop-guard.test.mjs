@@ -5,7 +5,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLoopGuard, createLoopGuardHook, loopGuardOptions, READ_ONLY_TOOLS } from "../lib/loop-guard.js";
-import { createNotifier } from "../lib/notify.js";
+import { createApprovalNotifier, createNotifier } from "../lib/notify.js";
+import { createRootLifecycle } from "../lib/lifecycle.js";
 
 const read = (guard, sessionID, file, output) =>
   guard.observe({ sessionID, tool: "read", args: { filePath: file }, output });
@@ -221,9 +222,197 @@ test("the notifier queues a failed send and drops the queue with the session", a
   assert.equal(notifier.pendingCount(), 0);
 });
 
+test("approval notification preserves root identity and waits for idle", async () => {
+  const sent = [];
+  const sdk = { session: { promptAsync: async (request) => { sent.push(request); } } };
+  const notifier = createApprovalNotifier({
+    sdk, directory: "/work",
+    identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt", variant: "fast" } }),
+    current: async () => true,
+  });
+  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
+  assert.equal(await notifier.notify("ses_root", "per_1"), false);
+  assert.deepEqual(sent, []);
+  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  assert.deepEqual(sent, [{
+    sessionID: "ses_root", directory: "/work", agent: "smart",
+    model: { providerID: "openai", modelID: "gpt", variant: "fast" },
+    parts: [{ type: "text", text: "A child permission request (per_1) is pending. Use guard_pending and guard_decide to inspect and decide it.", synthetic: true }],
+  }]);
+});
+
+test("approval notification drops stale and aborted requests without waking a root", async () => {
+  const sent = [];
+  const notifier = createApprovalNotifier({
+    sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work",
+    identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
+    current: async () => false,
+  });
+  assert.equal(await notifier.notify("ses_root", "per_stale"), false);
+  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
+  await notifier.notify("ses_root", "per_abort");
+  await notifier.onEvent({ type: "session.aborted", properties: { sessionID: "ses_root" } });
+  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  assert.deepEqual(sent, []);
+});
+
+test("approval notification retains a failed send for idle retry", async () => {
+  let fail = true;
+  const sent = [];
+  const notifier = createApprovalNotifier({
+    sdk: { session: { promptAsync: async (request) => { if (fail) throw new Error("temporary"); sent.push(request); } } }, directory: "/work",
+    identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
+    current: async () => true,
+  });
+  assert.equal(await notifier.notify("ses_root", "per_retry"), false);
+  assert.equal(notifier.pendingCount(), 1);
+  fail = false;
+  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  assert.equal(sent.length, 1);
+  assert.equal(notifier.pendingCount(), 0);
+});
+
+test("approval notification retains a failed authoritative escalation check for idle retry", async () => {
+  let currentReads = 0;
+  const sent = [];
+  const notifier = createApprovalNotifier({
+    sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work",
+    identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
+    current: async () => {
+      currentReads += 1;
+      if (currentReads === 1) throw new Error("native escalate unavailable");
+      return true;
+    },
+  });
+  assert.equal(await notifier.notify("ses_root", "per_queued"), false);
+  assert.equal(notifier.pendingCount(), 1);
+  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  assert.equal(sent.length, 1);
+});
+
+test("approval notification fences an identity lookup aborted before promptAsync", async () => {
+  let resolveIdentity;
+  const sent = [];
+  const lifecycle = createRootLifecycle();
+  const notifier = createApprovalNotifier({
+    sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work",
+    lifecycle,
+    identityFor: () => new Promise((resolve) => { resolveIdentity = resolve; }),
+    current: async () => true,
+  });
+  const waking = notifier.notify("ses_root", "per_late");
+  await Promise.resolve();
+  lifecycle.abort("ses_root");
+  resolveIdentity({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } });
+  assert.equal(await waking, false);
+  assert.deepEqual(sent, []);
+  assert.equal(notifier.pendingCount(), 0, "a cancelled root is never re-enqueued");
+});
+
+test("approval notification requeues if root becomes busy during identity lookup and rereads identity on idle", async () => {
+  let resolveIdentity;
+  let identityReads = 0;
+  const sent = [];
+  const notifier = createApprovalNotifier({
+    sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work",
+    identityFor: () => {
+      identityReads += 1;
+      return identityReads === 1
+        ? new Promise((resolve) => { resolveIdentity = resolve; })
+        : Promise.resolve({ agent: "fresh", model: { providerID: "openai", modelID: "new" } });
+    },
+    current: async () => true,
+  });
+  const waking = notifier.notify("ses_root", "per_busy");
+  await Promise.resolve();
+  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
+  resolveIdentity({ agent: "stale", model: { providerID: "openai", modelID: "old" } });
+  assert.equal(await waking, false);
+  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  assert.equal(identityReads, 2);
+  assert.equal(sent[0].agent, "fresh");
+});
+
+test("approval notification rechecks fresh pending after identity and drops a root deleted during lookup", async () => {
+  let release, reached;
+  let exists = true;
+  const waiting = new Promise((resolve) => { reached = resolve; });
+  const sent = [];
+  let checks = 0;
+  const notifier = createApprovalNotifier({
+    sdk: { session: { promptAsync: async (request) => sent.push(request) } },
+    identityFor: () => new Promise((resolve) => { release = resolve; reached(); }),
+    current: async () => { checks += 1; return exists; },
+  });
+  const waking = notifier.notify("ses_root", "per_deleted");
+  await waiting;
+  exists = false;
+  release({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } });
+  assert.equal(await waking, false);
+  assert.equal(checks, 2);
+  assert.deepEqual(sent, []);
+});
+
+test("approval notification never evicts the only still-pending cause under queue pressure", async () => {
+  const sent = [];
+  const notifier = createApprovalNotifier({
+    sdk: { session: { promptAsync: async (request) => sent.push(request) } },
+    identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
+    current: async (_root, id) => id === "per_0",
+  });
+  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
+  for (let i = 0; i < 101; i += 1) await notifier.notify("ses_root", `per_${i}`);
+  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  assert.equal(sent.length, 1, "the remaining authoritative pending request must still wake the root");
+  assert.equal(notifier.pendingCount(), 0);
+});
+
+test("an old failed send and an old idle-drain batch cannot acquire a resumed root's new token", async () => {
+  const lifecycle = createRootLifecycle();
+  let rejectSend, reached;
+  const waiting = new Promise((resolve) => { reached = resolve; });
+  const sent = [];
+  const notifier = createApprovalNotifier({
+    lifecycle,
+    sdk: { session: { promptAsync: (request) => {
+      sent.push(request);
+      if (sent.length > 1) return Promise.resolve();
+      return new Promise((_resolve, reject) => { rejectSend = reject; reached(); });
+    } } },
+    identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
+    current: async () => true,
+  });
+  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
+  await notifier.notify("ses_root", "per_1");
+  await notifier.notify("ses_root", "per_2");
+  const draining = notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  await waiting;
+  await notifier.onEvent({ type: "session.aborted", properties: { sessionID: "ses_root" } });
+  lifecycle.resume("ses_root", [{ type: "text", text: "continue" }]);
+  rejectSend(new Error("transport failed after abort and resume"));
+  await draining;
+  assert.equal(sent.length, 1, "the remaining old drain batch must not send into the new turn");
+  assert.equal(notifier.pendingCount(), 0, "the failed old send must not requeue into the new turn");
+});
+
+test("approval queue removes exact replied IDs and drains all remaining stale IDs", async () => {
+  const notifier = createApprovalNotifier({
+    sdk: { session: { promptAsync: async () => assert.fail("stale IDs must not send") } },
+    current: async () => false,
+    identityFor: async () => assert.fail("stale IDs must not read identity"),
+  });
+  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
+  for (const id of ["per_1", "per_1", "per_2", "per_3"]) await notifier.notify("ses_root", id);
+  assert.equal(notifier.pendingCount(), 3, "exact request IDs are deduplicated");
+  await notifier.onEvent({ type: "permission.replied", properties: { sessionID: "ses_child", requestID: "per_2" } });
+  assert.equal(notifier.pendingCount(), 2);
+  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  assert.equal(notifier.pendingCount(), 0);
+});
+
 // Wired through the real plugin: site config is read at import, so each case runs in
 // a subprocess with a throwaway HOME.
-const runPlugin = ({ config, calls }) => {
+const runPlugin = ({ config, calls, sessionID = "ses_root", parentID, captureAbort = false }) => {
   const home = mkdtempSync(join(tmpdir(), "guard-loop-"));
   try {
     mkdirSync(join(home, ".config/opencode-guard"), { recursive: true });
@@ -231,18 +420,25 @@ const runPlugin = ({ config, calls }) => {
     if (config) writeFileSync(join(home, ".config/opencode-guard/config.json"), JSON.stringify(config));
     const pluginUrl = new URL("../plugin.js", import.meta.url).href;
     const script = `
-      const client = { session: { get: async () => ({ data: {} }), abort: async () => {}, prompt: async () => {} } };
+      const aborts = [];
+      const client = { session: {
+        get: async (request) => ({ data: { id: request.path.id, ${parentID ? `parentID: ${JSON.stringify(parentID)}` : ""} } }),
+        abort: async (request) => { aborts.push(request); }, prompt: async () => {},
+      } };
       const { OpencodeGuard } = await import(${JSON.stringify(pluginUrl)});
       const hooks = await OpencodeGuard({ client, directory: "/work" });
       const outputs = [];
       for (let i = 0; i < ${calls}; i += 1) {
         const output = { title: "read", output: "same file body", metadata: {} };
-        await hooks["tool.execute.after"]({ tool: "read", sessionID: "ses_root", callID: "c" + i, args: { filePath: "/work/a.js" } }, output);
+         await hooks["tool.execute.after"]({ tool: "read", sessionID: ${JSON.stringify(sessionID)}, callID: "c" + i, args: { filePath: "/work/a.js" } }, output);
         outputs.push(output.output);
       }
-      console.log(JSON.stringify(outputs));
+       console.log(JSON.stringify(${captureAbort ? "{ outputs, aborts }" : "outputs"}));
     `;
-    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, HOME: home, OPENCODE_GUARD_CONFIG: "" }, encoding: "utf8" });
+    // This inline fake-client Node host is not an OpenCode or agent launch.
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, HOME: home, OPENCODE_GUARD_CONFIG: "", OPENCODE_AGENT_SHELL: "" }, encoding: "utf8",
+    });
     assert.equal(child.status, 0, child.stderr);
     return JSON.parse(child.stdout.trim().split("\n").at(-1));
   } finally {
@@ -261,4 +457,13 @@ test("the plugin warns a session that keeps re-reading an unchanged file", () =>
 test("loopGuard.enabled false in the site config turns the guard off", () => {
   const outputs = runPlugin({ config: { loopGuard: { enabled: false, warnAt: 1 } }, calls: 5 });
   assert.ok(outputs.every((text) => text === "same file body"));
+});
+
+test("the loop guard keeps its non-owned child abort unversioned", () => {
+  const result = runPlugin({
+    config: { loopGuard: { warnAt: 2, handBackAt: 3 } }, calls: 4,
+    sessionID: "ses_child", parentID: "ses_parent", captureAbort: true,
+  });
+  assert.equal(result.aborts.length, 1);
+  assert.deepEqual(result.aborts[0], { path: { id: "ses_child" }, query: { directory: "/work" } });
 });

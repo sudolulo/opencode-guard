@@ -1,0 +1,546 @@
+import { afterEach, expect } from "bun:test"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Npm } from "@opencode-ai/core/npm"
+import { Global } from "@opencode-ai/core/global"
+import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
+import { Effect } from "effect"
+import path from "path"
+import { disposeAllInstances, TestInstance } from "../fixture/fixture"
+import { testEffect } from "../lib/effect"
+import { Agent } from "../../src/agent/agent"
+import { Auth } from "../../src/auth"
+import { Config } from "../../src/config/config"
+import { ConfigParse } from "../../src/config/parse"
+import { RuntimeFlags } from "../../src/effect/runtime-flags"
+import { Permission } from "../../src/permission"
+import { Plugin } from "../../src/plugin"
+import { Provider } from "../../src/provider/provider"
+import { Skill } from "../../src/skill"
+import { SessionID } from "../../src/session/schema"
+import { NpmTest } from "../fake/npm"
+
+// Agent.Service captures each agent's permission provenance before its config layers are
+// flattened. These tests drive the real agent construction and then the real request-local
+// preparation, so they pin the whole path tools.ts uses.
+
+const it = testEffect(
+  LayerNode.compile(
+    LayerNode.group([Agent.node, Plugin.node, Provider.node, Auth.node, Config.node, Skill.node, RuntimeFlags.node]),
+    [
+      [RuntimeFlags.node, RuntimeFlags.layer({})],
+      [Npm.node, NpmTest.noop],
+    ],
+  ),
+)
+
+afterEach(async () => {
+  await disposeAllInstances()
+})
+
+const ROOT = "ses_root"
+
+const parentAsk = () =>
+  Effect.succeed({
+    status: "ask" as const,
+    approval: { kind: "parent" as const, sessionID: SessionID.make(ROOT) },
+    forceAsk: true,
+  })
+
+// Prepares a child's bash request for `name` exactly as session/tools.ts does.
+const prepareFor = (
+  name: string,
+  command: string,
+  trigger: NonNullable<Parameters<typeof Permission.prepareForRequest>[0]["trigger"]> = parentAsk,
+) =>
+  Effect.gen(function* () {
+    const agents = yield* Agent.Service
+    const agent = yield* agents.get(name)
+    const provenance = yield* agents.permissionContext(name)
+    return yield* Permission.prepareForRequest({
+      req: { permission: "bash", patterns: [command], always: [], metadata: { command } },
+      sessionID: "ses_child",
+      rootSessionID: ROOT,
+      agentRules: agent.permission,
+      sessionRules: [],
+      provenance,
+      trigger,
+    })
+  })
+
+const verdict = (ruleset: Permission.AgentProvenance["rules"], command: string) =>
+  Permission.evaluate("bash", command, ruleset).action
+
+for (const capability of ["exec", "write"]) {
+  it.instance(
+    `explicit role catch-all with tools catch-all and named bash allow stays denied (${capability})`,
+    () =>
+      Effect.gen(function* () {
+        const agents = yield* Agent.Service
+        const agent = yield* agents.get("policy")
+        expect(Permission.disabled(["bash"], agent.permission).has("bash")).toBe(false)
+        expect(verdict(agent.permission, "ls /tmp/opencode")).toBe("deny")
+        const out = yield* prepareFor("policy", "ls /tmp/opencode")
+        expect(verdict(out.ruleset, "ls /tmp/opencode")).toBe("deny")
+        expect(out.approval).toBeUndefined()
+        expect(verdict(agent.permission, "git status")).toBe("allow")
+      }),
+    {
+      config: {
+        agent: {
+          policy: {
+            capability,
+            tools: { "*": false },
+            permission: { "*": "deny", bash: { "git *": "allow" } },
+          },
+        },
+      },
+    },
+  )
+}
+
+const toolPolicy = { capability: "exec", tools: { "*": false }, permission: { bash: { "git *": "allow" as const } } }
+const rolePolicy = { capability: "exec", permission: { "*": "deny" as const, bash: { "git *": "allow" as const } } }
+
+const layers: {
+  name: string
+  global?: ConfigAgentV1.Info
+  project?: ConfigAgentV1.Info
+  markdown?: ConfigAgentV1.Info
+  mode?: ConfigAgentV1.Info
+  jsonMode?: ConfigAgentV1.Info
+  content?: ConfigAgentV1.Info
+  want: "allow" | "deny" | "ask"
+  availability?: string[]
+  deniedCommand?: string
+  parent?: boolean
+}[] = [
+  { name: "pure tools then unrelated overlay", global: toolPolicy, project: { description: "project" }, want: "ask" },
+  { name: "global role then project tools", global: rolePolicy, project: toolPolicy, want: "deny" },
+  { name: "global tools then project role", global: toolPolicy, project: rolePolicy, want: "deny" },
+  { name: "global role then different wildcard tool key", global: { permission: { "*": "deny" } }, project: { ...toolPolicy, tools: { "ba*": false } }, want: "deny" },
+  { name: "earlier named role is checked per requested pattern", global: { permission: { bash: { "rm *": "deny" } } }, project: { capability: "exec", tools: { "*": false }, permission: { "b*": { "git *": "allow" } } }, want: "ask", deniedCommand: "rm foo" },
+  { name: "project tools then markdown role", project: toolPolicy, markdown: rolePolicy, want: "deny" },
+  { name: "project role then markdown tools", project: rolePolicy, markdown: toolPolicy, want: "deny" },
+  { name: "project tools then legacy mode role", project: toolPolicy, mode: rolePolicy, want: "deny" },
+  { name: "project role then legacy mode tools", project: rolePolicy, mode: toolPolicy, want: "deny" },
+  { name: "legacy mode tools remains available", mode: toolPolicy, want: "ask" },
+  { name: "json mode tools remains available", jsonMode: toolPolicy, want: "ask" },
+  { name: "json mode tools does not erase role", project: rolePolicy, jsonMode: toolPolicy, want: "deny" },
+  { name: "content policy overrides project tools", project: toolPolicy, content: rolePolicy, want: "deny" },
+  { name: "content tools do not erase project role", project: rolePolicy, content: toolPolicy, want: "deny" },
+  { name: "pure content tools remain eligible", content: toolPolicy, want: "ask" },
+  { name: "global role then explicit project allow", global: rolePolicy, project: { permission: { "*": "allow" as const } }, want: "allow" },
+  { name: "global role then explicit project ask", global: rolePolicy, project: { permission: { "*": "ask" as const } }, want: "ask" },
+  { name: "global allow then tools deny", global: { permission: { "*": "allow" as const } }, project: toolPolicy, want: "ask" },
+  { name: "global role object then tools scalar", global: { permission: { "*": { "ls *": "deny" } } }, project: toolPolicy, want: "deny" },
+  { name: "global non-denied object then tools scalar", global: { permission: { "*": { "ls *": "ask" } } }, project: toolPolicy, want: "ask" },
+  { name: "explicit allow clears old role before markdown tools", global: rolePolicy, project: { permission: { "*": "allow" } }, markdown: toolPolicy, want: "ask" },
+  { name: "explicit ask clears old role before markdown tools", global: rolePolicy, project: { permission: { "*": "ask" } }, markdown: toolPolicy, want: "ask" },
+  // A tools-only chain cannot launder an explicit deny ceiling: the first overlay replaces it
+  // with a tools allow, the second with a tools deny that must NOT regain availability origin.
+  { name: "named deny survives tools allow then markdown tools deny", global: { permission: { "*": { "rm *": "deny" } } }, project: { tools: { "*": true } }, markdown: toolPolicy, want: "deny", deniedCommand: "rm foo" },
+  { name: "scalar deny survives tools allow then markdown tools deny", global: { permission: { "b*": "deny" } }, project: { tools: { "b*": true } }, markdown: { capability: "exec", tools: { "b*": false }, permission: { bash: { "git *": "allow" } } }, want: "deny", deniedCommand: "rm foo" },
+  { name: "tools allow then markdown tools deny stays parent-askable", project: { tools: { "*": true } }, markdown: toolPolicy, want: "ask", parent: true },
+  { name: "explicit allow replaces named deny before markdown tools", global: { permission: { "*": { "rm *": "deny" } } }, project: { permission: { "*": "allow" } }, markdown: toolPolicy, want: "ask", parent: true },
+  ...["write", "edit", "patch"].map((alias) => ({
+    name: `explicit edit object then tools ${alias} scalar`,
+    global: { permission: { edit: { "private/*": "deny" as const } } },
+    project: { ...toolPolicy, tools: { "*": false, [alias]: false } },
+    want: "ask" as const,
+    availability: ["*"],
+  })),
+]
+
+const bashKeys = ["*", "ba*", "bash", "b*"]
+for (const tool of bashKeys) {
+  for (const role of bashKeys) {
+    const allow = bashKeys.find((key) => key !== tool && key !== role)!
+    layers.push({
+      name: `policy-only invariant: global ${role} policy / project ${tool} tool / ${allow} allow-list`,
+      global: { permission: { [role]: "deny" } },
+      project: { capability: "exec", tools: { [tool]: false }, permission: { [allow]: { "git *": "allow" } } },
+      want: "deny",
+    })
+  }
+  const allow = bashKeys.find((key) => key !== tool)!
+  layers.push({
+    name: `policy-only invariant: pure ${tool} availability / ${allow} allow-list`,
+    project: { capability: "exec", tools: { [tool]: false }, permission: { [allow]: { "git *": "allow" } } },
+    want: "ask",
+  })
+}
+
+for (const scenario of layers) {
+  it.instance(`real layer origins: ${scenario.name}`, () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const config = yield* Config.Service
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const previous = Global.Path.config
+          ;(Global.Path as { config: string }).config = path.join(test.directory, "global")
+          return previous
+        }),
+        (previous) => Effect.sync(() => { (Global.Path as { config: string }).config = previous }),
+      )
+      if (scenario.content) yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const previous = process.env.OPENCODE_CONFIG_CONTENT
+          process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ agent: { policy: scenario.content } })
+          return previous
+        }),
+        (previous) => Effect.sync(() => {
+          if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
+          else process.env.OPENCODE_CONFIG_CONTENT = previous
+        }),
+      )
+      const write = (file: string, value: object) => Effect.promise(() => Bun.write(file, JSON.stringify({ $schema: "https://opencode.ai/config.json", ...value })))
+      if (scenario.global) yield* write(path.join(Global.Path.config, "opencode.json"), { agent: { policy: scenario.global } })
+      yield* write(path.join(test.directory, "opencode.json"), { agent: { policy: scenario.project ?? {} }, mode: { policy: scenario.jsonMode ?? {} } })
+      for (const [dir, value] of [["agent", scenario.markdown], ["mode", scenario.mode]] as const) {
+        if (value) yield* Effect.promise(() => Bun.write(path.join(test.directory, ".opencode", dir, "policy.md"), `---\n${JSON.stringify(value)}\n---\nRun tests.`))
+      }
+      const loaded = yield* config.get()
+      expect(loaded.agent?.policy).toBeDefined()
+      const out = yield* prepareFor("policy", "ls /tmp/opencode")
+      expect(verdict(out.ruleset, "ls /tmp/opencode")).toBe(scenario.want)
+      if (scenario.want === "deny") expect(out.approval).toBeUndefined()
+      if (scenario.parent) expect(out.approval?.kind).toBe("parent")
+      if (scenario.deniedCommand) {
+        const denied = yield* prepareFor("policy", scenario.deniedCommand)
+        expect(verdict(denied.ruleset, scenario.deniedCommand)).toBe("deny")
+        expect(denied.approval).toBeUndefined()
+      }
+      const agents = yield* Agent.Service
+      const agent = yield* agents.get("policy")
+      expect(verdict(agent.permission, "git status")).toBe("allow")
+      if (scenario.availability) {
+        const context = yield* agents.permissionContext("policy")
+        expect([...context!.availability].map((index) => context!.rules[index].permission)).toEqual(scenario.availability)
+        expect(Permission.evaluate("edit", "private/key", agent.permission).action).toBe("deny")
+      }
+    }),
+  )
+}
+
+for (const copy of ["json", "structured", "decode"] as const) {
+  it.instance(`normalized ${copy} copy cannot invent availability origin`, () =>
+    Effect.gen(function* () {
+      const config = yield* Config.Service
+      const loaded = yield* config.get()
+      const original = loaded.agent!.policy
+      loaded.agent!.policy = copy === "json"
+        ? JSON.parse(JSON.stringify(original))
+        : copy === "structured"
+          ? structuredClone(original)
+          : ConfigParse.schema(ConfigAgentV1.Info, original, "normalized agent copy")
+      expect(loaded.agent!.policy).toEqual(original)
+      const out = yield* prepareFor("policy", "ls /tmp/opencode")
+      expect(verdict(out.ruleset, "ls /tmp/opencode")).toBe("deny")
+      expect(out.approval).toBeUndefined()
+    }),
+    { config: { agent: { policy: toolPolicy } } },
+  )
+}
+
+it.instance(
+  "agent tools catch-all cannot relabel a preceding global policy catch-all deny",
+  () => Effect.gen(function* () {
+    const out = yield* prepareFor("policy", "ls /tmp/opencode")
+    expect(verdict(out.ruleset, "ls /tmp/opencode")).toBe("deny")
+    expect(out.approval).toBeUndefined()
+  }),
+  { config: { permission: { "*": "deny" }, agent: { policy: toolPolicy } } },
+)
+
+const finalPolicies: {
+  name: string
+  agent: string
+  permission: NonNullable<ConfigAgentV1.Info["permission"]>
+  want: "deny" | "ask"
+}[] = [
+  { name: "named user policy does not disable unrelated availability fallback", agent: "policy", permission: { bash: { "rm *": "deny" as const } }, want: "ask" as const },
+  { name: "later user catch-all allow clears named deny", agent: "policy", permission: { bash: { "rm *": "deny" as const, "*": "allow" as const } }, want: "ask" as const },
+  { name: "later user bash allow clears global deny", agent: "policy", permission: { "*": "deny" as const, bash: "allow" as const }, want: "ask" as const },
+  { name: "builtin role deny", agent: "title", permission: {}, want: "deny" as const },
+  { name: "user allow replaces builtin role deny", agent: "title", permission: { "*": "allow" as const }, want: "ask" as const },
+]
+for (const scenario of finalPolicies) {
+  it.instance(`final policy merge: ${scenario.name}`, () =>
+    Effect.gen(function* () {
+      const out = yield* prepareFor(scenario.agent, "ls /tmp/opencode")
+      expect(verdict(out.ruleset, "ls /tmp/opencode")).toBe(scenario.want)
+    }),
+    { config: { permission: scenario.permission, agent: { [scenario.agent]: toolPolicy } } },
+  )
+}
+
+it.instance("named global policy retains its separate human-only proposal route", () =>
+  Effect.gen(function* () {
+    const out = yield* prepareFor("policy", "rm file", () => Effect.succeed({
+      status: "ask" as const,
+      approval: { kind: "human-only" as const, sessionID: SessionID.make(ROOT) },
+      forceAsk: true,
+    }))
+    expect(verdict(out.ruleset, "rm file")).toBe("ask")
+    expect(out.approval?.kind).toBe("human-only")
+  }),
+  { config: { permission: { bash: { "rm *": "deny" } }, agent: { policy: { capability: "exec" } } } },
+)
+
+it.instance("Holden-shaped named global denies preserve ls fallback but not rm or mkfs", () =>
+  Effect.gen(function* () {
+    const out = yield* prepareFor("policy", "ls /tmp/opencode")
+    expect(verdict(out.ruleset, "ls /tmp/opencode")).toBe("ask")
+    expect(out.approval?.kind).toBe("parent")
+    for (const command of ["rm -rf /", "mkfs.ext4 /dev/test"]) {
+      const denied = yield* prepareFor("policy", command)
+      expect(verdict(denied.ruleset, command)).toBe("deny")
+      expect(denied.approval).toBeUndefined()
+    }
+  }),
+  { config: { permission: { bash: { "rm -rf /*": "deny", "mkfs*": "deny" } }, agent: { policy: { ...toolPolicy, capability: "write" } } } },
+)
+
+it.instance("tools allows cannot hide global role policy in the policy-only evaluation", () =>
+  Effect.gen(function* () {
+    const agents = yield* Agent.Service
+    const context = yield* agents.permissionContext("policy")
+    expect([...context!.availability].map((index) => context!.rules[index].action)).toEqual(["allow", "deny"])
+    const allowed = yield* prepareFor("policy", "ls /tmp/opencode")
+    expect(verdict(allowed.ruleset, "ls /tmp/opencode")).toBe("ask")
+    const denied = yield* prepareFor("policy", "rm foo")
+    expect(verdict(denied.ruleset, "rm foo")).toBe("deny")
+    expect(denied.approval).toBeUndefined()
+  }),
+  { config: { permission: { bash: { "rm *": "deny" } }, agent: { policy: { capability: "write", tools: { "b*": true, "ba*": false }, permission: { bash: { "git *": "allow" } } } } } },
+)
+
+it.instance(
+  "exec seat with tools {*: false} and a bash allow-list: an unmatched command can become a parent ask",
+  () =>
+    Effect.gen(function* () {
+      const context = yield* (yield* Agent.Service).permissionContext("tester")
+      expect(context?.capability).toBe("exec")
+
+      const unmatched = yield* prepareFor("tester", "./check-gates.sh")
+      expect(verdict(unmatched.ruleset, "./check-gates.sh")).toBe("ask")
+      expect(unmatched.approval?.kind).toBe("parent")
+
+      const listed = yield* prepareFor("tester", "go test ./...")
+      expect(verdict(listed.ruleset, "go test ./...")).toBe("allow")
+    }),
+  {
+    config: {
+      agent: {
+        tester: {
+          capability: "exec",
+          tools: { "*": false, read: true, bash: true },
+          permission: { bash: { "go test *": "allow" } },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "the same shape from explicit permission policy stays denied even when the hook asks",
+  () =>
+    Effect.gen(function* () {
+      const out = yield* prepareFor("policy", "./check-gates.sh")
+      expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+      expect(out.approval).toBeUndefined()
+    }),
+  {
+    config: {
+      agent: {
+        policy: {
+          capability: "exec",
+          permission: { "*": "deny", read: "allow", bash: { "go test *": "allow" } },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "an explicit bash `*` deny under tools {*: false} stays denied",
+  () =>
+    Effect.gen(function* () {
+      const out = yield* prepareFor("roled", "./check-gates.sh")
+      expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+    }),
+  {
+    config: {
+      agent: {
+        roled: {
+          capability: "write",
+          tools: { "*": false, bash: true },
+          permission: { bash: { "*": "deny", "git status": "allow" } },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "a user-global catch-all deny is explicit policy and stays denied",
+  () =>
+    Effect.gen(function* () {
+      const out = yield* prepareFor("globaled", "./check-gates.sh")
+      expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+    }),
+  {
+    config: {
+      permission: { "*": "deny" },
+      agent: {
+        globaled: {
+          capability: "exec",
+          tools: { bash: true },
+          permission: { bash: { "go test *": "allow" } },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "a read-capability seat stays denied",
+  () =>
+    Effect.gen(function* () {
+      const out = yield* prepareFor("reader", "./check-gates.sh")
+      expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+    }),
+  {
+    config: {
+      agent: {
+        reader: {
+          capability: "read",
+          tools: { "*": false, bash: true },
+          permission: { bash: { "git status": "allow" } },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "a seat with no declared capability stays denied",
+  () =>
+    Effect.gen(function* () {
+      expect((yield* (yield* Agent.Service).permissionContext("unknown"))?.capability).toBeUndefined()
+      const out = yield* prepareFor("unknown", "./check-gates.sh")
+      expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+    }),
+  {
+    config: {
+      agent: {
+        unknown: {
+          tools: { "*": false, bash: true },
+          permission: { bash: { "git status": "allow" } },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "tools {*: false, bash: true} keeps bash available and allowed",
+  () =>
+    Effect.gen(function* () {
+      const agent = yield* (yield* Agent.Service).get("runner")
+      expect(Permission.disabled(["bash"], agent.permission).has("bash")).toBe(false)
+      const out = yield* prepareFor("runner", "anything --at all")
+      expect(verdict(out.ruleset, "anything --at all")).toBe("allow")
+      expect(out.approval).toBeUndefined()
+    }),
+  {
+    config: {
+      agent: {
+        runner: { capability: "exec", tools: { "*": false, bash: true } },
+      },
+    },
+  },
+)
+
+it.instance(
+  "a disabled bash tool stays unavailable and denied",
+  () =>
+    Effect.gen(function* () {
+      const agent = yield* (yield* Agent.Service).get("nobash")
+      expect(Permission.disabled(["bash"], agent.permission).has("bash")).toBe(true)
+      const out = yield* prepareFor("nobash", "ls")
+      expect(verdict(out.ruleset, "ls")).toBe("deny")
+    }),
+  {
+    config: {
+      agent: {
+        nobash: { capability: "exec", tools: { "*": false, read: true } },
+      },
+    },
+  },
+)
+
+it.instance(
+  "capability declared in markdown frontmatter reaches the provenance sidecar",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(test.directory, ".opencode", "agent", "mdtester.md"),
+          `---
+description: Test runner.
+capability: exec
+mode: subagent
+tools:
+  "*": false
+  read: true
+  bash: true
+permission:
+  bash:
+    "go test *": allow
+---
+
+Run tests.
+`,
+        ),
+      )
+      const context = yield* (yield* Agent.Service).permissionContext("mdtester")
+      expect(context?.capability).toBe("exec")
+      const out = yield* prepareFor("mdtester", "./check-gates.sh")
+      expect(verdict(out.ruleset, "./check-gates.sh")).toBe("ask")
+    }),
+  { git: true },
+)
+
+it.instance(
+  "provenance stays with its config key when display names collide",
+  () =>
+    Effect.gen(function* () {
+      const agents = yield* Agent.Service
+      const execSeat = yield* agents.get("exec-seat")
+      const readerSeat = yield* agents.get("reader")
+      expect(execSeat.name).toBe("reader")
+      expect(readerSeat.name).toBe("reader-seat")
+      expect((yield* agents.permissionContext("exec-seat"))?.capability).toBe("exec")
+      expect((yield* agents.permissionContext("reader"))?.capability).toBe("read")
+    }),
+  {
+    config: {
+      agent: {
+        "exec-seat": { name: "reader", capability: "exec", tools: { "*": false, bash: true } },
+        reader: { name: "reader-seat", capability: "read", tools: { "*": false, bash: true } },
+      },
+    },
+  },
+)
+
+it.instance("the sidecar is not part of the public agent info", () =>
+  Effect.gen(function* () {
+    const agent = yield* (yield* Agent.Service).get("build")
+    expect(Object.keys(agent)).not.toContain("availability")
+    expect(Object.keys(agent)).not.toContain("provenance")
+    expect(agent.options).not.toHaveProperty("availability")
+  }),
+)

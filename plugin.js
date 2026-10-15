@@ -61,6 +61,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { tool } from "/home/dev/.config/opencode/node_modules/@opencode-ai/plugin/dist/tool.js";
 
 // The decision logic lives in ./lib/, not beside this file: opencode calls every
 // export of a plugin module as a Plugin function and drops the whole module if any
@@ -71,7 +72,7 @@ import { pathToFileURL } from "node:url";
 import {
   normalizeLevel, normalizeMode, normalizeGlobalMode, resolveTreeMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
   commandUnder, credentialAdvice, siteConfig,
-  strip, commandIsRead, launderReason, bashRulesLoad, parserError, bashRulesFromRuleset, configDenyReason, blanketAlwaysPattern, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
+  strip, commandIsRead, launderReason, bashRulesLoad, parserError, bashRulesFromRuleset, configDenyReason, bashDenyKind, blanketAlwaysPattern, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
   agentCapability, dispatchRefusal, staleToolRefusal, sessionIdle,
   nativeToolWritesControlFile, commandWritesControlFile,
@@ -79,10 +80,14 @@ import {
 import { brokerAvailable, brokerRequest, resolveProfileFor } from "./lib/broker.js";
 import { classifierConfig, classifierRoute, classifyDirect, verdictFromText } from "./lib/classifier.js";
 import { createLoopGuard, createLoopGuardHook, loopGuardOptions } from "./lib/loop-guard.js";
-import { createNotifier } from "./lib/notify.js";
+import { createApprovalNotifier, createNotifier } from "./lib/notify.js";
+import { readSessionIdentity } from "./lib/session-identity.js";
 import { loadSafetyNet, safetyNetVerdict } from "./lib/safety-net.js";
 import { createSessionTree, createTeamIndex, treeLookupDenial, treeRuleRefusal } from "./lib/tree.js";
 import { AGENT_SHELL_ENV, AGENT_SPAWN_REFUSAL, agentSpawnRefusal } from "./lib/agent-spawn.js";
+import { AUTHORITY_UNSUPPORTED, createAuthorityBroker } from "./lib/authority.js";
+import { createRootLifecycle } from "./lib/lifecycle.js";
+import { decideProposal } from "./lib/escalation.js";
 
 // Server plugins receive the legacy SDK client. The matching V2 client below
 // keeps its embedded-app fetch transport while generating V2 request bodies.
@@ -178,6 +183,39 @@ const controlDeny =
   "reveal window or classifier config). A person sets those, with oc-mode, oc-auto or oc-reveal " +
   "in their own terminal. If the change is really needed, say so and let the user make it.";
 
+const REVEAL_ARM_REFUSAL =
+  "[opencode-guard] blocked: the reveal window is armed by a person at a " +
+  "terminal, not from a session -- otherwise redaction would be something " +
+  "you could switch off for yourself. If you need an unredacted value, say " +
+  "so and let the user run `oc-reveal` themselves.";
+const armsReveal = (command) => /\boc-reveal\b/.test(command) || /\.config\/opencode\/reveal\b/.test(command);
+
+// The 2026-10-14 god escalation policy (docs/superpowers/specs/2026-10-14-god-escalation-policy-design.md).
+// Native-asking tools -> the permission each one asks for. Only these guarantee a native ask,
+// so only these may defer a guard floor from tool.execute.before to the permission hook.
+const DEFERRABLE = { bash: "bash", read: "read", glob: "glob", grep: "grep", edit: "edit", write: "edit" };
+// A deferred effect is correlated by its exact native call. Any part missing means there is
+// no safe key, never the shared string "undefined".
+const escalationKey = (sessionID, callID, permission) =>
+  [sessionID, callID, permission].every((part) => typeof part === "string" && part !== "")
+    ? `${sessionID}\u0000${callID}\u0000${permission}` : null;
+// A call's IDENTITY (its root binding) is keyed by the exact call alone, so every permission the
+// call raises (bash, then external_directory, ...) is judged with it; RESTRICTIONS (stashes,
+// root-policy markers) and judged marks stay keyed by the exact permission and never cross.
+const callKey = (sessionID, callID) =>
+  [sessionID, callID].every((part) => typeof part === "string" && part !== "") ? `${sessionID}\u0000${callID}` : null;
+// A judged mark settles only the request whose patterns the hook saw.
+const requestFingerprint = (patterns) => JSON.stringify(Array.isArray(patterns) ? patterns : []);
+const ESCALATION_LIMIT = 500;
+const ESCALATION_TTL_MS = 10 * 60 * 1000;
+// A hook error's class for the escalation logs, never its message: an SDK error can carry the
+// request body (and so the command). The guard's own authority errors are one class.
+const errorClass = (error) => {
+  if (typeof error?.code === "string" && /^[A-Z_]{1,40}$/.test(error.code)) return error.code;
+  if (/^\[opencode-guard\] permission authority unavailable/.test(String(error?.message ?? ""))) return "authority-unavailable";
+  return typeof error?.name === "string" && /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : "error";
+};
+
 export const OpencodeGuard = async ({ client, directory }) => {
   if (process.env[AGENT_SHELL_ENV] === "1") {
     // Not a thrown error: a plugin that throws at load is skipped and OpenCode carries on.
@@ -258,6 +296,105 @@ export const OpencodeGuard = async ({ client, directory }) => {
     if (list.length < 20) list.push(entry);
     denials.set(parentID, list);
     if (denials.size > 200) denials.clear();
+  };
+  // Deferred escalations (2026-10-14 policy). A STASH is a guard floor refusal carried from
+  // tool.execute.before to the permission.ask hook of the SAME native call (exact session,
+  // call and permission), where it becomes an annotated ask. A JUDGED mark is an operator ask
+  // this guard proposed and will settle itself with the root's judgment. Both are deferred
+  // effects of the root, so both carry the root binding captured when the request began.
+  // A stash is a restriction, so it is never forgotten while its call may still arrive. At most
+  // ESCALATION_LIMIT keys are held. Past ESCALATION_TTL_MS a stash is EXPIRED in place: its
+  // payload (reason, binding) is dropped, but a minimal tombstone keeps the SAME slot until the
+  // call's own hook (which denies it) or its tool completion consumes it. Nothing else removes a
+  // key -- no sweep, no eviction, not session.deleted (a late event for an older session
+  // incarnation must not erase a live restriction). When every slot is taken a NEW deferral is
+  // refused before its tool runs, never by dropping an accepted one. The cost: tombstones of
+  // calls that never complete hold slots, and so apply backpressure, until a process restart.
+  const pendingEscalations = new Map();
+  const judged = new Map();
+  const prune = (map, now, onDrop) => {
+    for (const [key, entry] of map) {
+      if (now - entry.at <= ESCALATION_TTL_MS && map.size <= ESCALATION_LIMIT) break;
+      map.delete(key);
+      onDrop?.(key, entry);
+    }
+  };
+  // Entries are appended in time order and a tombstone keeps its slot (Map.set on an existing
+  // key keeps its position), so the first live entry inside the time limit ends the scan.
+  // The same slots also hold ROOT-POLICY route markers (root-policy round): when a non-god
+  // session's bash call skips the guard floors because the ROOT's effective rules deny it, the
+  // marker { route: "root-policy", rootDeny } carries that restriction to the call's own hook.
+  // A marker has no `kind`: it is never a floor escalation and never reaches the table as one.
+  const entryLabel = (entry) => `${entry.kind ?? entry.route}/${entry.cls}`;
+  const expireStashes = (now) => {
+    for (const [key, entry] of pendingEscalations) {
+      if (entry.expired) continue;
+      if (now - entry.at <= ESCALATION_TTL_MS) break;
+      pendingEscalations.set(key, {
+        expired: true, at: entry.at, kind: entry.kind, route: entry.route, cls: entry.cls, permission: entry.permission, sessionID: entry.sessionID,
+      });
+      log("escalation-expired", `${entryLabel(entry)} for ${entry.permission} in ${entry.sessionID}: ` +
+        "the call did not reach its permission hook in time; its slot is kept and the call is denied if it still does");
+    }
+  };
+  const stash = (key, entry) => {
+    const now = Date.now();
+    expireStashes(now);
+    if (!pendingEscalations.has(key) && pendingEscalations.size >= ESCALATION_LIMIT) {
+      log("escalation-capacity", `${entryLabel(entry)} for ${entry.permission} in ${entry.sessionID}: ` +
+        `${ESCALATION_LIMIT} deferred floors are waiting; this call is refused before its tool runs`);
+      throw new Error(`[opencode-guard] blocked: ${ESCALATION_LIMIT} deferred guard floors are already waiting for their ` +
+        `permission hooks, so this call cannot defer its own (${entry.cls}) and is refused rather than run without it. ` +
+        "Retry once pending calls have finished.");
+    }
+    pendingEscalations.delete(key);
+    pendingEscalations.set(key, { ...entry, at: now });
+  };
+  const takeStash = (key) => {
+    if (!key) return {};
+    expireStashes(Date.now());
+    const entry = pendingEscalations.get(key);
+    if (!entry) return {};
+    pendingEscalations.delete(key);
+    return entry.expired ? { expired: entry } : { entry };
+  };
+  // The ORIGINAL root binding of an attended descendant's call (any tool), captured in
+  // tool.execute.before before any asynchronous rule or floor work and keyed by the exact call
+  // (session, call), with the tool that made it. It serves every permission.ask that call raises
+  // until its tool.execute.after (root-policy round): each ask validates it, and an operator ask
+  // the guard settles is bound to it. Unlike a stash it is an ELIGIBILITY, not a restriction:
+  // losing one (expired, evicted) only means the guard does not settle that call's operator asks
+  // itself and does not re-validate its root, and the person answers. So it may be evicted.
+  const callContexts = new Map();
+  const keepContext = (key, context) => {
+    const now = Date.now();
+    callContexts.delete(key);
+    callContexts.set(key, { ...context, at: now });
+    prune(callContexts, now, (_key, dropped) => log("call-context-evicted",
+      `${dropped.tool} in ${dropped.sessionID}: its root binding was dropped; an operator ask from it is left for the person`));
+  };
+  const getContext = (key) => {
+    if (!key) return undefined;
+    const entry = callContexts.get(key);
+    return entry && Date.now() - entry.at <= ESCALATION_TTL_MS ? entry : undefined;
+  };
+  // A root's mode as authority.rootContext reads it, re-read synchronously right before a
+  // deferred effect is emitted so a flip during an earlier await never applies a stale snapshot.
+  // A root with no mode file of its own runs under the global mode (root-policy round), exactly
+  // as modeFor resolves it; never a guessed "auto".
+  const rootModeOf = (sessionID) => sessionMode(sessionID) ?? globalMode();
+  const markJudged = (key, entry) => {
+    const now = Date.now();
+    judged.delete(key);
+    judged.set(key, { ...entry, at: now });
+    prune(judged, now, (_key, dropped) => log("judged-evicted", `${dropped.permission} in ${dropped.sessionID}: left for the person`));
+  };
+  const takeJudged = (key) => {
+    if (!key) return undefined;
+    prune(judged, Date.now(), (_key, dropped) => log("judged-evicted", `${dropped.permission} in ${dropped.sessionID}: left for the person`));
+    const entry = judged.get(key);
+    judged.delete(key);
+    return entry;
   };
   // command -> verdict, so the same command judged in tool.execute.before is not
   // re-judged when its permission prompt arrives moments later.
@@ -379,12 +516,58 @@ const modeFor = async (sessionID) => {
   return resolveTreeMode({ own, parent, nearest, fallback: globalMode() });
 };
 
+  // The v2 client reuses OpenCode's embedded transport. Do not construct it until
+  // authority is actually requested: an old host must retain the rest of the guard.
+  const approvalLifecycle = createRootLifecycle({
+    onError: (error) => log("approval-lifecycle-error", error?.message ?? error),
+    onDebug: (error) => log("approval-lifecycle-debug", error?.message ?? error),
+    // Only the parent links this process has already read (abort fencing is
+    // synchronous). Unknown sessions answer false and still tombstone.
+    // Assumes a cached child link is never reused for a root: if a child's delete event is lost and its ID is later recreated as a root, that root's aborts would wrongly skip tombstoning.
+    isChild: (sessionID) => {
+      const parent = sessionTree.knownParent(sessionID) ?? sessionInfo.get(sessionID)?.parentID;
+      return typeof parent === "string" && parent !== "";
+    },
+  });
+  const authority = createAuthorityBroker({
+    v2: new Proxy({}, { get: (_target, key) => v2Client()[key] }),
+    directory,
+    tree: sessionTree,
+    rootMode: async (sessionID) => rootModeOf(sessionID),
+    lifecycle: approvalLifecycle,
+    onError: (error) => log("approval-authority-error", error?.message ?? error),
+    onDebug: (error) => log("approval-authority-debug", error?.message ?? error),
+  });
+  // The capability is optional. Old hosts retain their unversioned cleanup calls;
+  // a host that advertises incarnations must give cleanup the create response's ID.
+  let classifierIncarnationSupport;
+  const classifierIncarnations = async () => {
+    if (classifierIncarnationSupport !== undefined) return classifierIncarnationSupport;
+    try {
+      const reply = await v2Client().experimental.capabilities.get({ directory });
+      const capabilities = reply?.data?.data ?? reply?.data ?? reply;
+      classifierIncarnationSupport = capabilities?.sessionIncarnation === 1;
+    } catch (error) {
+      log("classifier-incarnation-capability-unavailable", error?.message ?? error);
+      classifierIncarnationSupport = false;
+    }
+    return classifierIncarnationSupport;
+  };
+
   // Sterile-repeat loop guard (lib/loop-guard.js). The parent comes from the same
   // cached lookup modeFor uses, with the legacy client as a second source; a session
   // whose parent cannot be proved reads as a root, which is only ever warned and
   // never aborted.
   const loopOptions = loopGuardOptions(siteConfig().loopGuard);
   const notifier = createNotifier({ client, directory });
+  const approvalNotifier = createApprovalNotifier({
+    sdk: new Proxy({}, { get: (_target, key) => v2Client()[key] }),
+    directory,
+    identityFor: (sessionID) => readSessionIdentity({ sdk: v2Client(), directory, sessionID }),
+    current: (sessionID, permissionID, incarnationID) => authority.current({ sessionID, permissionID, incarnationID }),
+    lifecycle: approvalLifecycle,
+    onError: (error) => log("approval-notify-error", error?.message ?? error),
+  });
   const loopHook = createLoopGuardHook({
     guard: loopOptions.enabled ? createLoopGuard(loopOptions) : null,
     parentOf: async (sessionID) => {
@@ -462,12 +645,15 @@ const modeFor = async (sessionID) => {
   // the guard owns the child lifecycle and reports against its real session ID.
   const classifyRouted = async (command, cwd, parentSessionID, config) => {
     let sessionID = null;
+    let incarnationID = null;
+    let useIncarnation = false;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CLASSIFIER_TIMEOUT_MS);
     try {
       if (typeof parentSessionID !== "string" || !parentSessionID.startsWith("ses")) {
         throw new Error("classifier requires an OpenCode parent session");
       }
+      useIncarnation = await classifierIncarnations();
 
       // A classifier must be a child of the requesting session. Root sessions made
       // through the V2 endpoint do not inherit this embedded instance's OAuth
@@ -480,9 +666,14 @@ const modeFor = async (sessionID) => {
       // Hey wraps the HTTP response in `data`, and the OpenCode V2 endpoint wraps
       // its SessionV2Info in another `data`. Accept either response style so the
       // classifier always uses OpenCode's allocated session ID.
-      sessionID = (createdSession?.data?.data ?? createdSession?.data ?? createdSession)?.id;
+      const createdInfo = createdSession?.data?.data ?? createdSession?.data ?? createdSession;
+      sessionID = createdInfo?.id;
       if (typeof sessionID !== "string" || !sessionID.startsWith("ses")) {
         throw new Error("OpenCode did not return a classifier session ID");
+      }
+      incarnationID = createdInfo?.incarnationID;
+      if (useIncarnation && (typeof incarnationID !== "string" || incarnationID === "")) {
+        throw new Error("OpenCode did not return a classifier session incarnation ID");
       }
       // The legacy prompt endpoint runs through the same authenticated provider
       // resolution as an ordinary Task child and returns the completed assistant
@@ -556,12 +747,19 @@ const modeFor = async (sessionID) => {
     } finally {
       clearTimeout(timer);
       if (sessionID) {
+        const cleanupQuery = useIncarnation ? { directory, incarnationID } : { directory };
+        const checkedCleanup = async (operation) => {
+          const got = await operation();
+          if (got?.error !== undefined && got?.error !== null) {
+            throw new Error(`HTTP ${got?.response?.status ?? "?"}: ${got.error?.message ?? got.error?.name ?? got.error}`);
+          }
+        };
         // The classifier timeout aborts the HTTP client, not necessarily the server-side
         // agent loop. Deleting immediately raced that loop's final step-start write and
         // turned a routine timeout into a SQLite foreign-key error. Stop the disposable
         // loop, then wait until opencode reports it idle before removing its message history.
         try {
-          await client.session.abort({ path: { id: sessionID }, query: { directory } });
+          await checkedCleanup(() => client.session.abort({ path: { id: sessionID }, query: cleanupQuery }));
         } catch (error) {
           log("classifier-cleanup-abort-failed", `${sessionID} ${error?.message ?? error}`);
         }
@@ -580,7 +778,7 @@ const modeFor = async (sessionID) => {
             if (!idle) await new Promise((r) => setTimeout(r, 250));
           }
           if (!idle) throw new Error(`still busy after ${CLEANUP_IDLE_MS}ms`);
-          await client.session.delete({ path: { id: sessionID }, query: { directory } });
+          await checkedCleanup(() => client.session.delete({ path: { id: sessionID }, query: cleanupQuery }));
         } catch (error) {
           // A leaked disposable session is safer than deleting beneath a loop that has
           // not proved it is idle; a later operator cleanup can remove the row safely.
@@ -700,7 +898,182 @@ const modeFor = async (sessionID) => {
     return verdict;
   };
 
+  // The guard floor for one call, as a value rather than a throw: null, or
+  // { class, message, promptable? } where `message` is exactly the refusal the legacy
+  // sequence throws and every deny(...) / prompt(...) log line stays where it was. One
+  // implementation, two callers: the legacy sequence throws the message; a god descendant on
+  // a native-asking tool stashes it as a parent escalation (2026-10-14 policy). `rootRules`
+  // (descendants only) adds the ROOT's allow rules to the launder check.
+  const floorRefusal = async ({ tool, args, command, sessionID, mode, lvl, rules, rootRules }) => {
+    // Native read/glob/grep calls never produce a shell command for the guard
+    // below. Check their actual path arguments before the tool resolves a glob.
+    if (nativeCredentialGuardBlocks({ level: lvl, mode, unattended: isUnattended, tool, args, directory })) {
+      log("deny(credential)", tool);
+      return { class: "credential", message: credentialDeny("ssh keys, cloud or registry credentials, or a configured secret path") };
+    }
+    if (!command) return null;
+
+    // ---- The floor. Static, precise, and on in every other mode. ----
+    // A throw from cc-safety-net is a denial, not a skip: its contract is "if
+    // checkCommand throws, do not run the command".
+    const net = safetyNetVerdict(safetyNet.checkCommand, { command, cwd: directory });
+    if (net.kind === "deny") {
+      const errored = net.ruleId === "analysis-error";
+      log(errored ? `deny(net-error)` : "deny(net)", command);
+      return {
+        class: errored ? "net-error" : "net",
+        message: `[opencode-guard] blocked: ${net.reason} ` +
+          `(rule ${net.ruleId ?? "?"}). Do not rephrase to evade this; ` +
+          `pick a genuinely safer approach or ask the user.`,
+      };
+    }
+
+    // The launder floor (lib/policy.js): opencode's own allow globs already let this
+    // run unprompted, but its parsed arguments make a read verb write a file or run
+    // a program. A glob cannot see inside argv; this can. Commands opencode would
+    // ask about are not judged here -- a person approved those.
+    const laundered = launderReason(command, rules) ?? (rootRules ? launderReason(command, rootRules) : null);
+    if (laundered) {
+      log("deny(launder)", command);
+      return {
+        class: "launder",
+        message: `[opencode-guard] blocked: \`${laundered.segment}\` matches an allow rule for a read-only command, ` +
+          `but ${laundered.reason}. Use the Write or Edit tool to write files (a redirect into /tmp/opencode/ is fine), or ask the user to run it. ` +
+          `Do not rephrase to evade this.`,
+      };
+    }
+
+    // Hard credential guard: file paths that could match `cat *`/`ls *` allow
+    // rules. Always refused regardless of mode or attendance -- the permission
+    // system cannot be trusted to stop these because an agent's own `allow`
+    // block is appended after the global rules and opencode takes the last match.
+    if (touchesHardCredentials(command)) {
+      log("deny(credential)", command);
+      return { class: "credential", message: credentialDeny("ssh keys, cloud or registry credentials, or a configured secret path") };
+    }
+
+    // Promptable credential guard: commands that are specific enough to never
+    // match a broad allow rule (rbw, bw, op, pass). In unattended sessions
+    // there is no one to ask, so refuse. In attended sessions the caller lets the
+    // command fall through to opencode's permission system, where `*`=`ask`
+    // prompts the user -- the event handler is also guarded to never auto-approve
+    // a credential command.
+    if (touchesPromptableCredentials(command)) {
+      if (isUnattended) {
+        log("deny(credential)", command);
+        return { class: "credential", message: credentialDeny("a password-manager CLI -- and an unattended session has no one to ask") };
+      }
+      log("prompt(credential)", command);
+      return { class: "credential-promptable", promptable: true, message: credentialDeny("a password-manager CLI") };
+    }
+    if (tool === "pty_write") return null;  // credential check above is the whole job
+    if (lvl === "static") return null;
+
+    // ---- Above the floor, the classifier answers one question: may this run
+    // without asking anyone? So it runs exactly where nothing will be asked --
+    // an unattended session, or auto mode. Manual and edits never reach the
+    // model at all: there is a person, and opencode will ask them.
+    if (!isUnattended && !classifierDecides(mode)) return null;
+    // Named in every denial below. A mode change is invisible to the agent,
+    // so a command that ran a minute ago and is refused now reads as the
+    // classifier being nondeterministic -- when what actually changed is the
+    // mode. Saying which state made the decision is what lets the agent tell
+    // "approval lapsed" from "verdict changed".
+    const state = isUnattended ? "unattended session" : `mode: ${mode}`;
+
+    if (commandIsRead(command)) { log("allow(read)", command); return null; }
+    // Privacy profiles must not have command text shipped to a cloud classifier,
+    // and with no lane at all there is nothing to ask. The profile is the
+    // broker's concept, read through lib/broker.js; without the broker every
+    // session resolves "auto".
+    const route = await routeFor(sessionID);
+    if (!route.lanes.length) {
+      log(`deny(${route.profile}-no-classifier)`, command);
+      return {
+        class: "no-classifier",
+        message: `[opencode-guard] denied (${state}, profile: ${route.profile}): ${route.reason}, so this could not be judged. ` +
+          "`oc-auto static` keeps static checks only, or switch to manual mode for a person to approve the command.",
+      };
+    }
+    const verdict = await classifyCached(command, sessionID, route);
+    if (verdict === "SAFE") return null;
+
+    // ---- Auto mode DENIES; it does not ask. A refusal is what auto mode is for:
+    // try another way, do the parts that do not depend on this, and escalate to the
+    // person only when the capability is genuinely required.
+    if (verdict === "RISKY") {
+      log("deny(llm)", command);
+      return {
+        class: "llm",
+        message: `[opencode-guard] denied (${state}, level: ${lvl}): this looks risky to run unattended (writes ` +
+          "outside the project, privilege escalation, package/service/system state, " +
+          "history rewrite, or credentials).\n" +
+          "If other work does not depend on this, carry on with that. You MAY reach " +
+          "the same goal a genuinely safer way -- a narrower command, a read instead " +
+          "of a write, a tool that does not need this. Do NOT rephrase the same " +
+          "action to get past this check.\n" +
+          "If the capability really is required, STOP and tell the user what you " +
+          "were trying to do and why. They can switch to manual mode and run it " +
+          "themselves, or approve it there.",
+      };
+    }
+
+    // No verdict, and in auto mode nothing is going to ask. Deciding "allow" here
+    // would be the one thing this plugin promises not to do.
+    log(`deny(${verdict})`, command);
+    return {
+      class: "classifier-unavailable",
+      message: `[opencode-guard] denied (${state}, level: ${lvl}): the command classifier is unavailable (${verdict}), ` +
+        "so this could not be judged. Carry on with anything that does not depend on " +
+        "it. `oc-auto static` continues with static checks only, and manual mode " +
+        "asks the user instead.",
+    };
+  };
+
+  // Old host (AUTHORITY_UNSUPPORTED) and no stash: the permission hook keeps its earlier
+  // semantics exactly. Only a verified god root's OWN ordinary request (not one a configured
+  // deny names) is left untouched; everything else rethrows the unsupported error. Ancestry
+  // failures propagate as their own errors -- an unverifiable session is never taken for a root.
+  // No grant and no override is ever produced here.
+  const oldHostAsk = async (sessionID, command, error) => {
+    const chain = await sessionTree.ancestry(sessionID);
+    if (!Array.isArray(chain) || chain.length === 0) throw error;
+    const hard = Boolean(command && configDenyReason(command, await rulesFor(sessionID)));
+    if (chain.at(-1) === sessionID && sessionMode(sessionID) === "god" && !hard) return;
+    throw error;
+  };
+
   return {
+    tool: {
+      guard_pending: tool({
+        description: "List native pending parent approvals owned by this god-mode root.",
+        args: {},
+        async execute(_args, ctx) {
+          return JSON.stringify(await authority.pending({ sessionID: ctx.sessionID }));
+        },
+      }),
+      guard_decide: tool({
+        description: "Approve once or reject one native parent approval owned by this god-mode root.",
+        args: {
+          permissionID: tool.schema.string(),
+          decision: tool.schema.enum(["once", "reject"]),
+          message: tool.schema.string().optional(),
+        },
+        async execute(args, ctx) {
+          return authority.decide({ sessionID: ctx.sessionID, ...args });
+        },
+      }),
+    },
+    "chat.message": async (input, output) => {
+      // Only the canonical root's own real user content can resume a root that
+      // stopped. Child workflow prompts and our synthetic approval wakeups do not.
+      try {
+        await authority.resume({ sessionID: input?.sessionID, parts: output?.parts });
+      } catch (error) {
+        log("approval-resume-error", error?.message ?? error);
+        throw error;
+      }
+    },
     // A local classifier agent on a thinking model THINKS by default, and a
     // thinking verdict was measured at 44.8s against the 12s broker-lane budget --
     // the gate then refuses with "classifier is unavailable", which is a dead shell
@@ -730,6 +1103,160 @@ const modeFor = async (sessionID) => {
     "shell.env": async (input, output) => {
       if (!input?.sessionID) return;
       output.env = { ...output.env, [AGENT_SHELL_ENV]: "1" };
+    },
+
+    // Core keeps the original ruleset and validates this request-local proposal
+    // (2026-10-14 policy, design section 5.1). A proposal can tighten any verdict to an
+    // exact annotated ask or a deny; the only loosening is `override: "root"`, which native
+    // accepts solely for a root's own visible-tool deny. Which refusal escalates, and to
+    // whom, is decided by lib/escalation.js; this hook only gathers its inputs.
+    "permission.ask": async (input, output) => {
+      const req = input?.req ?? input;
+      const sessionID = req?.sessionID ?? input?.sessionID;
+      const permission = req?.permission ?? input?.permission;
+      const callID = req?.tool?.callID ?? input?.tool?.callID;
+      const key = escalationKey(sessionID, callID, permission);
+      // Taken first, so a stash or route marker is consumed by exactly one hook call whatever
+      // happens next. The two are different types: a floor ESCALATION ({ kind }) is the table's
+      // `escalation` input; a ROOT-POLICY marker ({ route }) only pins the table's rootDeny.
+      const { entry: held, expired } = takeStash(key);
+      const escalation = held && !held.route ? held : undefined;
+      const marker = held?.route === "root-policy" ? held : undefined;
+      // The call's identity, NOT consumed: every permission this call raises is judged with it.
+      const context = getContext(callKey(sessionID, callID));
+      // A deferred guard floor must never run because the guard failed, was switched off or
+      // the request went stale: deny this exact call, leaving no grant behind. The log names
+      // the request and the floor's class, never the command (it may carry a secret).
+      const failClosed = (kind, detail) => {
+        delete output.approval;
+        delete output.override;
+        delete output.forceAsk;
+        output.status = "deny";
+        log(kind, detail);
+      };
+      const what = held ? `${entryLabel(held)} for ${permission} in ${sessionID}` : `${permission} in ${sessionID}`;
+      // An expired stash or route marker is still a restriction, at every level.
+      if (expired) {
+        failClosed("deny(expired-escalation)", `${entryLabel(expired)} for ${permission} in ${sessionID}: ` +
+          "its deferred guard floor expired before this hook; retry the call");
+        return;
+      }
+      if (level() === "off") {
+        // A floor deferred (or skipped for a root deny) while the guard was on was a refusal:
+        // switching the guard off afterwards must not let that exact call run. Calls with no
+        // deferral take the off path.
+        if (held) failClosed("escalation-off", `${what}: the guard was switched off after the floor was deferred; denied, retry the call`);
+        return;
+      }
+      if (!sessionID) return;
+      const command = strip(req?.metadata?.command);
+      if (isUnattended) {
+        if (held) failClosed("escalation-error", `${what}: an unattended session cannot carry an escalation`);
+        return;
+      }
+      // The call's ORIGINAL root binding, captured in tool.execute.before before any floor: the
+      // restriction's own, else the call context. Set BEFORE any await (root-policy round): a
+      // failure while a restriction or a bound call is known denies; it never rethrows into a
+      // native plain verdict.
+      const original = held ?? context;
+      try {
+        let ctx;
+        try {
+          ctx = await authority.rootContext(sessionID);
+        } catch (error) {
+          // An old host keeps the earlier hook semantics. Transport, HTTP and malformed
+          // capability failures are not an old host and propagate (fail closed).
+          if (error?.code !== AUTHORITY_UNSUPPORTED || original) throw error;
+          await oldHostAsk(sessionID, command, error);
+          return;
+        }
+        if (held) {
+          // Lead rulings 6 and 7: a stash (or route marker) belongs to the root, mode class and
+          // root incarnation it was captured under. A root that left (or entered) god since then,
+          // or a replaced or aborted root, gets no escalation from it: the exact call is denied,
+          // and a retry is judged afresh under whatever holds now.
+          if (ctx.rootSessionID !== held.root || (ctx.rootMode === "god") !== (held.mode === "god")) {
+            failClosed("escalation-stale", `${what}: the root's mode changed after the floor was deferred; denied, retry the call`);
+            return;
+          }
+        }
+        // The ROOT's effective bash deny (winning rule). The god root's own override and a god
+        // descendant's stash proposal need no asynchronous rules load.
+        const needsRootDeny = permission === "bash" && Boolean(command) &&
+          !(ctx.rootMode === "god" && (ctx.isRoot || escalation));
+        const currentRootDeny = needsRootDeny ? bashDenyKind(command, await rulesFor(ctx.rootSessionID)) : null;
+        // A route marker pins the root deny the floors were skipped for. If the root's rules say
+        // something else now, no safe proposal follows from either answer: deny.
+        if (marker && currentRootDeny !== marker.rootDeny) {
+          failClosed("deny(root-policy-changed)", `${what}: the root's rules changed after the floors were skipped; denied, retry the call`);
+          return;
+        }
+        const proposal = decideProposal({ ...ctx, permission, status: output.status, escalation, rootDeny: currentRootDeny });
+        // A stash always maps to a proposal in the table; reaching here is a guard bug.
+        if (!proposal && escalation) throw new Error(`stashed ${escalation.kind} escalation produced no proposal`);
+        if (!proposal && !original) return;
+        if (original) {
+          // Validate the binding captured when the call began, even for a call native allows and
+          // the table leaves alone; never re-capture here, so a root replaced or aborted meanwhile
+          // is never adopted for this call. A root's own marker carries no binding.
+          if (ctx.rootSessionID !== original.root) {
+            failClosed("escalation-stale", `${what}: the call's root changed after it began; denied, retry the call`);
+            return;
+          }
+          // Lead rulings 6 and 7 for a call with no restriction too: its floors ran under the mode
+          // class captured when it began. A root that left (or entered) god since then gets no
+          // verdict from that run; the exact call is denied and a retry is judged afresh.
+          if (!held && (ctx.rootMode === "god") !== (original.mode === "god")) {
+            failClosed("escalation-stale", `${what}: the root's mode changed after the call began; denied, retry the call`);
+            return;
+          }
+          if (original.binding) await authority.assertRequestBinding(original.binding);
+        }
+        // Immediately before the output, with no await after it: a mode flip during any await
+        // above must not emit a proposal made under the earlier mode.
+        if (rootModeOf(ctx.rootSessionID) !== ctx.rootMode) {
+          if (original) {
+            failClosed("escalation-stale", `${what}: the root's mode changed while the request was checked; denied, retry the call`);
+          } else {
+            log("proposal-stale", `${what}: the root's mode changed while the request was checked; native's verdict stands`);
+          }
+          return;
+        }
+        if (!proposal) {
+          // The floors were skipped for a root deny and the table now forms no proposal (native
+          // and the root disagree): never a plain allow.
+          if (marker) {
+            failClosed("deny(root-policy)", `${what}: the floors were skipped for a root deny that no longer forms a proposal; denied`);
+            return;
+          }
+          // A bound call native decides alone (validated above): native's verdict stands.
+          return;
+        }
+        if (proposal.status === "deny") {
+          failClosed("deny(root-policy)", `${what}: the root's own rules deny this command`);
+          return;
+        }
+        // An operator ask the guard settles itself is a deferred grant of the root, bound to the
+        // call's ORIGINAL binding and to the exact request patterns this hook saw. Without a
+        // context (no call key, no before-hook context, or one that was lost) it stays unmarked
+        // and the person answers it.
+        const mark = proposal.judged && key && context && !held ? {
+          sessionID, permission, root: ctx.rootSessionID, mode: ctx.rootMode, binding: context.binding,
+          fingerprint: requestFingerprint(req?.patterns),
+        } : undefined;
+        if (proposal.judged && !mark) log("judged-unbound", `${what}: no root binding from the call's start; left for the person`);
+        output.status = proposal.status;
+        if (proposal.override) output.override = proposal.override;
+        if (proposal.approval) output.approval = proposal.approval;
+        if (proposal.forceAsk) output.forceAsk = true;
+        if (proposal.always) output.always = proposal.always;
+        if (mark) markJudged(key, mark);
+        log(proposal.override ? "allow(god/override)" : proposal.approval ? `escalate(${proposal.approval.kind})` : "allow(god)", what);
+      } catch (error) {
+        // No restriction and no bound call: native keeps its own verdict.
+        if (!original) throw error;
+        failClosed("escalation-error", `${what}: ${errorClass(error)}`);
+      }
     },
 
     "tool.execute.before": async (input, output) => {
@@ -807,28 +1334,162 @@ const modeFor = async (sessionID) => {
         throw new Error(treeRefusal);
       }
 
-      // God mode: the person asked for everything to run, floor included, and
-      // said so in a mode labelled god. Stand aside before the floor, not after --
-      // half a bypass would be a floor that "sometimes" applies, which is worse
-      // to reason about than none. Redaction (tool.execute.after) still runs.
-      // This lifts THIS plugin's floor (cc-safety-net, the reveal guard and the
-      // credential guard). opencode's own deny globs in opencode.json are a
-      // separate native layer no plugin can lift, which is the place for a
-      // last-resort hard floor (rm -rf /*, mkfs*, dd of=/dev/* ...) that should
-      // stand even in god.
-      // ATTENDED ONLY: the mode was set in front of a person, in one session, and
-      // that is the whole grant. An unattended run keeps the floor even when its
-      // per-session file says god -- `opencode run --session <id>` re-enters TUI
-      // sessions headless, so file provenance is not the same thing as a person
-      // present.
+      // ---- The 2026-10-14 god escalation policy
+      // (docs/superpowers/specs/2026-10-14-god-escalation-policy-design.md, section 5.2).
+      // God mode: the person asked for everything to run, floor included, and said so in a
+      // mode labelled god. On a capable host (native permissionAuthority 2) for an attended
+      // session that grant now has two halves:
+      //   - the god ROOT's own calls stand aside before every guard floor, and native denies
+      //     of its own visible-tool requests (opencode.json named rules such as `rm -rf /*`,
+      //     role and ceiling denies) are lifted by an exact, logged `override: "root"` in the
+      //     permission hook -- one request at a time, never persisted;
+      //   - every refusal of a DESCENDANT on a native-asking tool (bash, read, glob, grep,
+      //     edit, write) -- guard floors, control-file writes and reveal-arm included -- is
+      //     deferred to that call's native ask and becomes an exact parent ask (once/reject)
+      //     the root model answers. Nothing escalates to Holden under god.
+      // The guard no longer re-applies config deny rules for those tools: native denies are
+      // authoritative over "Always" approvals on a capable host (native Task 1), and the
+      // permission hook routes them. Root-policy round: under a non-god root every session is
+      // judged as the root's own, so the ROOT's effective bash deny routes the call (named ->
+      // human-once, catch-all -> explicit deny) even where the session's own rules allow it;
+      // under a god root it is a parent ask. See lib/escalation.js for the table.
+      // KNOWN GAP (design 9, default 4; follow-up owner: lead): non-deferrable process tools
+      // (pty_spawn, bg_run, ...) do not guarantee a native ask, so their refusals still throw
+      // for god descendants, exactly as before.
+      // Unattended sessions, level `off` and old hosts keep the legacy sequence below:
+      // no escalation and no override. ATTENDED ONLY: the mode was set in front of a person,
+      // in one session, and that is the whole grant -- `opencode run --session <id>`
+      // re-enters TUI sessions headless, so file provenance is not a person present.
+      // Redaction (tool.execute.after) still runs in every mode.
+      let ctx = null;
+      if (!isUnattended && input?.sessionID) {
+        try {
+          ctx = await authority.rootContext(input.sessionID);
+        } catch (error) {
+          // Only an explicitly old host takes the legacy path. A transport, HTTP or
+          // malformed-probe failure is not an old host: fail closed.
+          if (error?.code !== AUTHORITY_UNSUPPORTED) throw error;
+        }
+      }
+      // The floors' judgment mode on a capable host (root-policy round): a non-god root's whole
+      // tree is judged in the ROOT's current legacy mode (manual / edits / auto), so a child's own
+      // god file (or a looser inherited one) never turns a manual or edits root's descendant into
+      // an auto one. currentMode() still runs first: its G3 ancestry gate is unchanged. Under a
+      // god root a descendant's own resolved mode applies, capped at auto (the floors defer).
+      const floorMode = async () => {
+        const resolved = await currentMode();
+        if (!ctx) return resolved;
+        if (ctx.rootMode !== "god") return ctx.rootMode;
+        return resolved === "god" ? "auto" : resolved;
+      };
+      // The call's identity for its permission hooks: the root binding, captured for EVERY tool
+      // call of an attended descendant BEFORE any asynchronous rule or floor work (lead ruling 7),
+      // so a root aborted or replaced while that work (an agent-rules load, a classifier call) is
+      // in flight never inherits this call's escalation or judgment. A capture failure refuses
+      // the call before its tool runs, god or not (root-policy round). It is kept, keyed by the
+      // exact (session, call), only once the call is let through (see keepCall).
+      let binding;
+      const contextKey = callKey(input?.sessionID, input?.callID);
+      if (ctx && !ctx.isRoot && contextKey) {
+        binding = await authority.captureRequestBinding(ctx.rootSessionID);
+      }
+      const keepCall = () => {
+        if (binding) keepContext(contextKey, { sessionID: input.sessionID, tool: input?.tool, root: ctx.rootSessionID, mode: ctx.rootMode, binding });
+      };
+      if (ctx) {
+        if (ctx.isRoot && ctx.rootMode === "god") { log("allow(god)", command ?? input?.tool); return; }
+        const permissionKey = DEFERRABLE[input?.tool];
+        if (permissionKey) {
+          const key = escalationKey(input.sessionID, input?.callID, permissionKey);
+          const godChild = !ctx.isRoot && ctx.rootMode === "god";
+          // The call is let through: keep its identity for its permission hooks.
+          const proceed = () => keepCall();
+          // The reason and the log carry the floor's class, never the command: native request
+          // metadata already shows the exact command to whoever answers.
+          const defer = (kind, cls) => {
+            stash(key, {
+              kind, cls, permission: permissionKey, reason: `${cls}: deferred ${permissionKey} floor`,
+              sessionID: input.sessionID, root: ctx.rootSessionID, mode: ctx.rootMode, binding,
+            });
+            log(`stash(${kind}/${cls})`, `${permissionKey} in ${input.sessionID} call ${String(input.callID).slice(0, 64)}`);
+            keepCall();
+          };
+          // The guard's own switches and the reveal window: a person sets those. A god
+          // descendant may ask the root model (lead ruling 2; a once-approval changes policy
+          // durably); everyone else is refused as before.
+          if (nativeToolWritesControlFile({ tool: input?.tool, args: output?.args, directory }) || (command && commandWritesControlFile(command))) {
+            if (godChild && key) { defer("parent", "control-file"); return; }
+            log(command ? "deny(control-file)" : `deny(${input?.tool}/control-file)`, command ?? input?.tool);
+            throw new Error(controlDeny);
+          }
+          if (command && armsReveal(command)) {
+            if (godChild && key) { defer("parent", "reveal-arm"); return; }
+            log("deny(reveal-arm)", command);
+            throw new Error(REVEAL_ARM_REFUSAL);
+          }
+          const rules = await rulesFor(input.sessionID);
+          const rootRules = ctx.isRoot ? rules : await rulesFor(ctx.rootSessionID);
+          // Non-god (root-policy round): a session is judged as its ROOT's own. When the root's
+          // EFFECTIVE rules (winning rule, bashDenyKind) deny the command -- whatever the
+          // session's own rules let native say -- the floors are not run here: the hook routes
+          // the call (named -> human-once, catch-all -> explicit deny). Agreed precedence: this
+          // route runs AHEAD of the static floors, cc-safety-net included, so a named root deny
+          // such as `mkfs*` reaches the human once rather than a net refusal. The skipped floors
+          // are replaced by a slot-retained ROOT-POLICY marker for this exact call, so the hook
+          // can never let it through as a plain allow if native or the rules disagree later.
+          const rootDeny = !godChild && permissionKey === "bash" && command ? bashDenyKind(command, rootRules) : null;
+          if (rootDeny) {
+            if (!key) {
+              // No exact call to carry the restriction to: refuse it here, as the legacy path does.
+              log("deny(config)", command);
+              throw new Error(
+                `[opencode-guard] blocked: \`${configDenyReason(command, rootRules)?.segment ?? command}\` matches a deny rule in the opencode permission config. ` +
+                `Deny rules hold in every mode and over any "Always" approval. Do not rephrase to evade this; ask the user.`,
+              );
+            }
+            stash(key, {
+              route: "root-policy", rootDeny, cls: `root-${rootDeny}`, permission: permissionKey,
+              sessionID: input.sessionID, root: ctx.rootSessionID, mode: ctx.rootMode, binding,
+            });
+            log(`route(root-policy/${rootDeny})`, `${permissionKey} in ${input.sessionID} call ${String(input.callID).slice(0, 64)}`);
+            keepCall();
+            return;
+          }
+          const refusal = await floorRefusal({
+            tool: input?.tool, args: output?.args, command, sessionID: input.sessionID,
+            mode: await floorMode(), lvl, rules, rootRules: ctx.isRoot ? undefined : rootRules,
+          });
+          if (!refusal) { proceed(); return; }
+          if (godChild) {
+            if (!key) throw new Error(refusal.message);
+            defer("parent", refusal.class);
+            return;
+          }
+          if (refusal.promptable) {
+            if (ctx.isRoot) return; // the root's native prompt, as before
+            if (key && binding) {
+              defer("human-only", refusal.class);
+              return;
+            }
+          }
+          throw new Error(refusal.message);
+        }
+        // Non-deferrable tools fall through to the legacy throwing sequence.
+      }
+
+      // ---- Legacy sequence: old hosts, unattended sessions, and non-deferrable tools.
       // The config's DENY rules, re-applied here -- above the god bypass, because they are
-      // the floor god is documented to keep. opencode checks its rules and then the run's
+      // the floor god keeps on these paths. opencode checks its rules and then the run's
       // "Always" approvals, last match wins: one "Always" that saved `snip *` overrides
       // every deny rule (opencode's arity table does not know the snip wrapper), and a
-      // plugin cannot see or revoke those approvals. A deny verdict needs no person to ask,
-      // so enforcing it here changes nothing that was meant to run.
+      // plugin cannot see or revoke those approvals. None of these paths has a native exact
+      // ask to route a deny to, so it is refused here.
       if (command) {
-        const denied = configDenyReason(command, await rulesFor(input?.sessionID));
+        // Root-policy round: a capable host's descendant is judged as its root's own, so the
+        // ROOT's deny holds here too even where the session's own rules allow the command.
+        // These tools have no guaranteed native ask to route it to, so it is refused.
+        const denied = configDenyReason(command, await rulesFor(input?.sessionID)) ??
+          (ctx && !ctx.isRoot ? configDenyReason(command, await rulesFor(ctx.rootSessionID)) : null);
         if (denied) {
           log("deny(config)", command);
           throw new Error(
@@ -838,7 +1499,7 @@ const modeFor = async (sessionID) => {
         }
       }
 
-      if (!isUnattended && (await currentMode()) === "god") { log("allow(god)", command ?? input?.tool); return; }
+      if (!ctx && !isUnattended && (await currentMode()) === "god") { log("allow(god)", command ?? input?.tool); return; }
 
       // The guard's own switches (lib/policy.js, "The guard's own switches") are set
       // by a person, not from a tool call.
@@ -846,155 +1507,28 @@ const modeFor = async (sessionID) => {
         log(`deny(${input?.tool}/control-file)`, input?.tool);
         throw new Error(controlDeny);
       }
-
-      // Native read/glob/grep calls never produce a shell command for the guard
-      // below. Check their actual path arguments before the tool resolves a glob.
-      if (nativeCredentialGuardBlocks({
-        level: lvl, mode: await currentMode(), unattended: isUnattended,
-        tool: input?.tool, args: output?.args, directory,
-      })) {
-        log("deny(credential)", input?.tool);
-        throw new Error(credentialDeny("ssh keys, cloud or registry credentials, or a configured secret path"));
-      }
-      if (!command) return;
-
-      // ---- The floor. Static, precise, and on in every other mode. ----
-      // A throw from cc-safety-net is a denial, not a skip: its contract is "if
-      // checkCommand throws, do not run the command".
-      const net = safetyNetVerdict(safetyNet.checkCommand, { command, cwd: directory });
-      if (net.kind === "deny") {
-        log(net.ruleId === "analysis-error" ? `deny(net-error)` : "deny(net)", command);
-        throw new Error(
-          `[opencode-guard] blocked: ${net.reason} ` +
-          `(rule ${net.ruleId ?? "?"}). Do not rephrase to evade this; ` +
-          `pick a genuinely safer approach or ask the user.`,
-        );
-      }
-
-      // The launder floor (lib/policy.js): opencode's own allow globs already let this
-      // run unprompted, but its parsed arguments make a read verb write a file or run
-      // a program. A glob cannot see inside argv; this can. Commands opencode would
-      // ask about are not judged here -- a person approved those.
-      const laundered = launderReason(command, await rulesFor(input?.sessionID));
-      if (laundered) {
-        log("deny(launder)", command);
-        throw new Error(
-          `[opencode-guard] blocked: \`${laundered.segment}\` matches an allow rule for a read-only command, ` +
-          `but ${laundered.reason}. Use the Write or Edit tool to write files (a redirect into /tmp/opencode/ is fine), or ask the user to run it. ` +
-          `Do not rephrase to evade this.`,
-        );
-      }
-
-      // Before any allow rule can apply: reading a credential store is never
-      // ordinary work, whatever the permission rules happen to say. This lives in
-      // the plugin rather than in a deny glob because an agent's own `allow` block
-      // is appended after the global rules and opencode takes the LAST match.
       // The reveal window is meant to be armed by a person at a terminal. An agent
       // that could arm it could turn redaction off for itself, which would make the
       // whole thing decorative -- so naming it from a tool call is refused. This
       // stops a helpful model unblocking itself; it is not proof against one that
       // sets out to construct the path another way.
-      if (/\boc-reveal\b/.test(command) || /\.config\/opencode\/reveal\b/.test(command)) {
+      if (command && armsReveal(command)) {
         log("deny(reveal-arm)", command);
-        throw new Error(
-          "[opencode-guard] blocked: the reveal window is armed by a person at a " +
-          "terminal, not from a session -- otherwise redaction would be something " +
-          "you could switch off for yourself. If you need an unredacted value, say " +
-          "so and let the user run `oc-reveal` themselves.",
-        );
+        throw new Error(REVEAL_ARM_REFUSAL);
       }
-
-      if (commandWritesControlFile(command)) {
+      if (command && commandWritesControlFile(command)) {
         log("deny(control-file)", command);
         throw new Error(controlDeny);
       }
 
-      // Hard credential guard: file paths that could match `cat *`/`ls *` allow
-      // rules. Always throw regardless of mode or attendance -- the permission
-      // system cannot be trusted to stop these because an agent's own `allow`
-      // block is appended after the global rules and opencode takes the last match.
-      if (touchesHardCredentials(command)) {
-        log("deny(credential)", command);
-        throw new Error(credentialDeny("ssh keys, cloud or registry credentials, or a configured secret path"));
-      }
-
-      // Promptable credential guard: commands that are specific enough to never
-      // match a broad allow rule (rbw, bw, op, pass). In unattended sessions
-      // there is no one to ask, so throw. In attended sessions, return and let
-      // the command fall through to opencode's permission system, where `*`=`ask`
-      // prompts the user -- the event handler is also guarded to never auto-approve
-      // a credential command.
-      if (touchesPromptableCredentials(command)) {
-        if (isUnattended) {
-          log("deny(credential)", command);
-          throw new Error(credentialDeny("a password-manager CLI -- and an unattended session has no one to ask"));
-        }
-        log("prompt(credential)", command);
-        return;
-      }
-      if (input?.tool === "pty_write") return;  // credential check above is the whole job
-      if (lvl === "static") return;
-
-      // ---- Above the floor, the classifier answers one question: may this run
-      // without asking anyone? So it runs exactly where nothing will be asked --
-      // an unattended session, or auto mode. Manual and edits never reach the
-      // model at all: there is a person, and opencode will ask them.
-      const resolvedMode = await currentMode();
-      if (!isUnattended && !classifierDecides(resolvedMode)) return;
-      // Named in every denial below. A mode change is invisible to the agent,
-      // so a command that ran a minute ago and is refused now reads as the
-      // classifier being nondeterministic -- when what actually changed is the
-      // mode. Saying which state made the decision is what lets the agent tell
-      // "approval lapsed" from "verdict changed".
-      const state = isUnattended ? "unattended session" : `mode: ${resolvedMode}`;
-
-      if (commandIsRead(command)) { log("allow(read)", command); return; }
-      // Privacy profiles must not have command text shipped to a cloud classifier,
-      // and with no lane at all there is nothing to ask. The profile is the
-      // broker's concept, read through lib/broker.js; without the broker every
-      // session resolves "auto".
-      const route = await routeFor(input.sessionID);
-      if (!route.lanes.length) {
-        log(`deny(${route.profile}-no-classifier)`, command);
-        throw new Error(
-          `[opencode-guard] denied (${state}, profile: ${route.profile}): ${route.reason}, so this could not be judged. ` +
-          "`oc-auto static` keeps static checks only, or switch to manual mode for a person to approve the command.",
-        );
-      }
-      const verdict = await classifyCached(command, input.sessionID, route);
-      if (verdict === "SAFE") return;
-
-      // ---- Auto mode DENIES; it does not ask. A dialog cannot be pre-empted from
-      // a plugin anyway (the permission.ask hook never fires on 1.18.22), so the
-      // choice is between a modal on every gray command and a refusal the agent can
-      // act on. A refusal is what auto mode is for: try another way, do the parts
-      // that do not depend on this, and escalate to the person only when the
-      // capability is genuinely required.
-      if (verdict === "RISKY") {
-        log("deny(llm)", command);
-        throw new Error(
-          `[opencode-guard] denied (${state}, level: ${lvl}): this looks risky to run unattended (writes ` +
-          "outside the project, privilege escalation, package/service/system state, " +
-          "history rewrite, or credentials).\n" +
-          "If other work does not depend on this, carry on with that. You MAY reach " +
-          "the same goal a genuinely safer way -- a narrower command, a read instead " +
-          "of a write, a tool that does not need this. Do NOT rephrase the same " +
-          "action to get past this check.\n" +
-          "If the capability really is required, STOP and tell the user what you " +
-          "were trying to do and why. They can switch to manual mode and run it " +
-          "themselves, or approve it there.",
-        );
-      }
-
-      // No verdict, and in auto mode nothing is going to ask. Deciding "allow" here
-      // would be the one thing this plugin promises not to do.
-      log(`deny(${verdict})`, command);
-      throw new Error(
-        `[opencode-guard] denied (${state}, level: ${lvl}): the command classifier is unavailable (${verdict}), ` +
-        "so this could not be judged. Carry on with anything that does not depend on " +
-        "it. `oc-auto static` continues with static checks only, and manual mode " +
-        "asks the user instead.",
-      );
+      const refusal = await floorRefusal({
+        tool: input?.tool, args: output?.args, command, sessionID: input?.sessionID,
+        mode: await floorMode(), lvl, rules: await rulesFor(input?.sessionID),
+      });
+      // A promptable credential in an attended session returns to opencode's own prompt.
+      if (refusal && !refusal.promptable) throw new Error(refusal.message);
+      // The call is let through: keep a capable host's descendant identity for its permission hooks.
+      keepCall();
     },
 
     "tool.execute.after": async (input, output) => {
@@ -1016,11 +1550,71 @@ const modeFor = async (sessionID) => {
           log(`surfaced(${raised.length})`, input.sessionID);
         }
       }
+      // A stash still present after its tool ran means the native permission hook never
+      // fired for that call, so a deferred guard floor was NOT applied. A loud alarm, not
+      // prevention: prevention is native's guarantee that every deferrable tool asks.
+      // Above the level check: the floor was deferred while the guard was on.
+      // Completion also frees the call's slot (live stash or expired tombstone) and drops its
+      // call context: both are single-use and belong to this call only.
+      const missedKey = escalationKey(input?.sessionID, input?.callID, DEFERRABLE[input?.tool]);
+      const contextKey = callKey(input?.sessionID, input?.callID);
+      if (contextKey) callContexts.delete(contextKey);
+      // A FAILED call (native marks a tool that threw or was interrupted after its before-hook)
+      // did not run its action, so a floor still stashed for it was never bypassed: free the slot
+      // quietly instead of alarming. Without this, each such call held a slot until restart.
+      if (input?.failed === true) {
+        if (missedKey && pendingEscalations.delete(missedKey)) {
+          log("escalation-abandoned", `${input?.tool} in ${input?.sessionID}: the call failed before its permission hook; slot freed`);
+        }
+        return;
+      }
+      if (missedKey && pendingEscalations.delete(missedKey)) {
+        await reportError("escalation-missed", `opencode-guard: a ${input?.tool} call in ${input?.sessionID} ran without reaching its permission hook, ` +
+          `so a deferred guard floor was not applied. Native must ask on every ${input?.tool} call.`);
+      }
       if (level() === "off") return;
       redact(input, output);
       await loopHook.after(input, output);
     },
     event: async ({ event }) => {
+      // A session ID may be reused after deletion. Evict synchronously before any
+      // notifier promise can reject, and keep every cache independent so one bad
+      // cleanup never leaves another stale.
+      // Deliberately NOT incarnation-bound, unlike the admission/escalation handling
+      // below. session-info, session-tree and team-index are read-through caches the
+      // guard re-reads from the host on a miss, so evicting on a delayed event for an
+      // older incarnation costs the replacement one re-read and can never close an
+      // admission or drop an escalation; keeping a stale entry instead could serve a
+      // deleted session's parent or teammate classification to its same-ID
+      // replacement. loop-guard holds repeat counters, not host facts: a late
+      // eviction only restarts the replacement's count, the same as a fresh session.
+      if (event?.type === "session.deleted") {
+        const gone = event.properties?.info?.id ?? event.properties?.sessionID;
+        if (gone) {
+          for (const [cache, forget] of [
+            ["session-info", () => sessionInfo.delete(gone)],
+            ["session-tree", () => sessionTree.forget(gone)],
+            ["team-index", () => teamIndex.forget(gone)],
+            ["loop-guard", () => loopHook.forget(gone)],
+          ]) {
+            try {
+              forget();
+            } catch (error) {
+              log("session-delete-eviction-error", `${cache} ${gone}: ${error?.message ?? error}`);
+            }
+          }
+        }
+      }
+      // Native dispatch does not await event hooks. Start this FIRST: abort and
+      // delete close the shared admission token synchronously, before even the
+      // legacy notifier's already-resolved promise can yield to another event.
+      const approvalEvent = approvalNotifier.onEvent(event);
+      // Carry one admission across the whole observe -> promote -> wake chain,
+      // including the await between helpers. A later real user turn gets a NEW
+      // token; old event continuations must never silently acquire that token.
+      const approvalToken = event?.type === "permission.asked" && event.properties?.approval?.kind === "parent"
+        ? approvalLifecycle.track(event.properties.approval.sessionID) : undefined;
+      authority.onEvent(event);
       // Agent teams: index every task part that names a child, at every level, so
       // turning the guard back on finds the index current. observe() does not throw
       // on any event shape; the catch is for the unforeseen, and it is logged.
@@ -1031,10 +1625,7 @@ const modeFor = async (sessionID) => {
       }
       try {
         await notifier.onEvent(event);
-        if (event?.type === "session.deleted") {
-          const gone = event.properties?.info?.id ?? event.properties?.sessionID;
-          if (gone) loopHook.forget(gone);
-        }
+        await approvalEvent;
       } catch (error) {
         log("loop-guard-error", error?.message ?? error);
       }
@@ -1070,9 +1661,73 @@ const modeFor = async (sessionID) => {
       // and is stale here, the same way it was stale about `requestID`.
       const permission = p?.permission;
       if (!permission || !p?.id) return;
+      if (p?.approval?.kind === "parent") {
+        // Native persistence precedes this event, so promotion never races an
+        // unqueryable request and the root can inspect it as soon as it is awake.
+        try {
+          // The wake carries the { sessionID, incarnationID } binding observe captured,
+          // and observe's admission: when observe re-admitted a replaced root,
+          // approvalToken is closed and the wake must use the replacement's token.
+          const bound = await authority.observe(p, approvalToken);
+          await approvalNotifier.notify(bound?.sessionID, p.id, bound?.token ?? approvalToken, bound?.incarnationID);
+        } catch (error) {
+          log("approval-observe-error", error?.message ?? error);
+        }
+        return;
+      }
+      // These annotations are native authority decisions. human-only belongs solely to the
+      // private TUI. An operator ask belongs to the attended root user, EXCEPT one this guard
+      // itself proposed as "judged as root" (2026-10-14 policy, auto descendants): that one is
+      // settled here with the ROOT's judgment. An escalated parent request, an unmarked one,
+      // or one whose mark a restart lost stays with the person.
+      if (p?.approval?.kind === "human-only") return;
+      let judgedMark;
+      if (p?.approval?.kind === "operator") {
+        judgedMark = takeJudged(escalationKey(p.sessionID, p?.tool?.callID, permission));
+        // Exact: the mark's root, and the very request patterns its hook saw. Taken either way,
+        // so a mark never outlives the first request that claims it.
+        if (!judgedMark || p.approval.sessionID !== judgedMark.root) return;
+        if (judgedMark.fingerprint !== requestFingerprint(p?.patterns)) {
+          log("judged-mismatch", `${permission} in ${p.sessionID}: the request is not the one the mark was made for; left for the person`);
+          return;
+        }
+      }
+      // A judged mark is a deferred grant of the root: it acts only while the root, its mode
+      // and its bound incarnation and admission are still the ones it was proposed under.
+      // Checked before judging and again immediately before any reply; on a mismatch the
+      // request is left for the person, never transferred to the new root or mode.
+      const stillJudged = async () => {
+        try {
+          const ctx = await authority.rootContext(p.sessionID);
+          if (ctx.rootSessionID !== judgedMark.root || ctx.rootMode !== judgedMark.mode) {
+            log("judged-stale", `${p.id}: the root or its mode changed since the ask was proposed; left for the person`);
+            return false;
+          }
+          await authority.assertRequestBinding(judgedMark.binding);
+          // Re-read after the last await: the mode can change during the binding's root read.
+          if (rootModeOf(judgedMark.root) !== judgedMark.mode) {
+            log("judged-stale", `${p.id}: the root's mode changed while the ask was revalidated; left for the person`);
+            return false;
+          }
+          return true;
+        } catch (error) {
+          log("judged-stale", `${p.id}: ${errorClass(error)}; left for the person`);
+          return false;
+        }
+      };
+      if (judgedMark && !await stillJudged()) return;
       let currentMode;
+      let judgeID = p.sessionID;
       try {
-        currentMode = await modeFor(p.sessionID);
+        // Judged as the ROOT would be (ruling 7): its mode, never a descendant's own mode file. A
+        // plain ask from a descendant resolves its root through the session tree first.
+        if (judgedMark) {
+          judgeID = judgedMark.root;
+        } else if ((await infoFor(p.sessionID))?.parentID) {
+          const chain = await sessionTree.ancestry(p.sessionID);
+          if (chain.length > 1) judgeID = chain[chain.length - 1];
+        }
+        currentMode = await modeFor(judgeID);
       } catch (error) {
         // G3 could not resolve an inherited mode (modeFor logged why). Approving or
         // rejecting would be a guess, so the prompt stays with the person, exactly
@@ -1087,7 +1742,9 @@ const modeFor = async (sessionID) => {
       // refusal has to be ANSWERED rather than left standing -- standing aside drops
       // the prompt on the person, which is the babysitting this removes. The main
       // session holds the mode the child was refused, so it is the one that decides.
-      const ownMode = sessionMode(p.sessionID);
+      // A judged ask is always a descendant's, answered on its parent's behalf.
+      // A descendant never owns its mode here (ruling 7), so it is always delegated.
+      const ownMode = judgedMark || judgeID !== p.sessionID ? null : sessionMode(p.sessionID);
       const parentID = ownMode ? null : (await infoFor(p.sessionID))?.parentID;
       const delegated = !ownMode && !!parentID;
       // A privacy profile with no local classifier stands aside entirely: nothing
@@ -1122,6 +1779,8 @@ const modeFor = async (sessionID) => {
       }
 
       const refuse = async (reason) => {
+        // A judged ask that went stale meanwhile is left for the person (handled: true).
+        if (judgedMark && !await stillJudged()) return true;
         try {
           await client.postSessionIdPermissionsPermissionId({
             path: { id: p.sessionID, permissionID: p.id },
@@ -1154,6 +1813,7 @@ const modeFor = async (sessionID) => {
         log(`prompt(${currentMode}/${permission}/credential)`, command);
         return;
       }
+      if (judgedMark && !await stillJudged()) return;
       try {
         await client.postSessionIdPermissionsPermissionId({
           path: { id: p.sessionID, permissionID: p.id },

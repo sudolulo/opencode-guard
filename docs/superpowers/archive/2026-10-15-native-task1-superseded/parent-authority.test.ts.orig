@@ -1,0 +1,283 @@
+import { test, expect } from "bun:test"
+import { Effect } from "effect"
+import { Permission } from "../../src/permission"
+import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { SessionID } from "../../src/session/schema"
+
+// Request-local preparation with the trusted agent provenance sidecar. These tests pin two
+// invariants: (1) only a catch-all bash deny produced by an exec/write seat's TOOL AVAILABILITY
+// (`tools: {"*": false}`) may become a parent/operator ask; (2) a validated hook annotation on an
+// ORIGINAL ask survives preparation, and a hook allow on an original ask allows only that request.
+
+const rule = (permission: string, pattern: string, action: "allow" | "deny" | "ask"): PermissionV1.Rule => ({
+  permission,
+  pattern,
+  action,
+})
+
+const ROOT = "ses_root"
+const LEAF = "ses_leaf"
+
+type Output = Parameters<NonNullable<Parameters<typeof Permission.prepareForRequest>[0]["trigger"]>>[1]
+
+const hook = (output: Output) => () => Effect.succeed(output)
+const parentAsk = hook({
+  status: "ask",
+  approval: { kind: "parent", sessionID: SessionID.make(ROOT) },
+  forceAsk: true,
+})
+const operatorAsk = hook({
+  status: "ask",
+  approval: { kind: "operator", sessionID: SessionID.make(ROOT) },
+  forceAsk: true,
+})
+
+// The tester shape: defaults, then `tools: {"*": false, ...}` (index 1 is the availability deny),
+// then the explicit bash allow-list.
+const availabilityRules = [rule("*", "*", "allow"), rule("*", "*", "deny"), rule("bash", "go test *", "allow")]
+const availability = (capability: string | undefined, rules = availabilityRules, indices = [1]) => ({
+  capability,
+  rules,
+  availability: new Set(indices),
+  globalPolicy: new Set<number>(),
+})
+
+const bash = (command: string) => ({
+  permission: "bash",
+  patterns: [command],
+  always: [command.split(" ")[0] + " *"],
+  metadata: { command },
+})
+
+const prepare = (input: {
+  command: string
+  agentRules?: PermissionV1.Ruleset
+  sessionRules?: PermissionV1.Ruleset
+  provenance?: Permission.AgentProvenance
+  trigger?: Parameters<typeof Permission.prepareForRequest>[0]["trigger"]
+  sessionID?: string
+  permission?: string
+}) =>
+  Effect.runPromise(
+    Permission.prepareForRequest({
+      req: { ...bash(input.command), permission: input.permission ?? "bash" },
+      sessionID: input.sessionID ?? LEAF,
+      rootSessionID: ROOT,
+      agentRules: input.agentRules ?? availabilityRules,
+      sessionRules: input.sessionRules ?? [],
+      provenance: input.provenance,
+      trigger: input.trigger,
+    }),
+  )
+
+const verdict = (ruleset: PermissionV1.Ruleset, pattern: string, permission = "bash") =>
+  Permission.evaluate(permission, pattern, ruleset).action
+
+// ---- Defect 1: provenance ----
+
+test("exec seat: an unmatched bash command under a tools-availability catch-all becomes a parent ask", async () => {
+  const out = await prepare({ command: "./check-gates.sh", provenance: availability("exec"), trigger: parentAsk })
+  expect(verdict(out.ruleset, "./check-gates.sh")).toBe("ask")
+  expect(out.approval).toEqual({ kind: "parent", sessionID: SessionID.make(ROOT) })
+  expect(out.forceAsk).toBe(true)
+  expect(out.always).toEqual([])
+})
+
+test("write seat: the same shape may become an operator ask", async () => {
+  const out = await prepare({ command: "./check-gates.sh", provenance: availability("write"), trigger: operatorAsk })
+  expect(verdict(out.ruleset, "./check-gates.sh")).toBe("ask")
+  expect(out.approval?.kind).toBe("operator")
+})
+
+test("the allow-listed command stays allowed and is not re-annotated", async () => {
+  const out = await prepare({ command: "go test ./...", provenance: availability("exec"), trigger: parentAsk })
+  expect(verdict(out.ruleset, "go test ./...")).toBe("allow")
+  expect(out.approval).toBeUndefined()
+})
+
+test("an EXPLICIT permission-policy catch-all deny stays denied even when the hook asks", async () => {
+  // Identical rules, but the `*` deny came from `permission: {"*": "deny"}`: no availability index.
+  for (const trigger of [parentAsk, operatorAsk, hook({ status: "ask" })]) {
+    const out = await prepare({
+      command: "./check-gates.sh",
+      provenance: availability("exec", availabilityRules, []),
+      trigger,
+    })
+    expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+    expect(out.approval).toBeUndefined()
+  }
+})
+
+test("an explicit role bash `*` deny (reviewer shape) stays denied even when the hook asks", async () => {
+  const rules = [rule("*", "*", "allow"), rule("*", "*", "deny"), rule("bash", "*", "deny"), rule("bash", "git status", "allow")]
+  const out = await prepare({
+    command: "./check-gates.sh",
+    agentRules: rules,
+    provenance: availability("exec", rules, [1]),
+    trigger: parentAsk,
+  })
+  expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+})
+
+test("a read-capability seat stays denied even with tools-availability provenance", async () => {
+  const out = await prepare({ command: "./check-gates.sh", provenance: availability("read"), trigger: parentAsk })
+  expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+  expect(out.approval).toBeUndefined()
+})
+
+test("missing or unknown provenance fails closed", async () => {
+  for (const provenance of [undefined, availability(undefined), availability("admin")]) {
+    const out = await prepare({ command: "./check-gates.sh", provenance, trigger: parentAsk })
+    expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+  }
+})
+
+test("provenance captured for a different ruleset fails closed", async () => {
+  const other = [rule("*", "*", "deny"), rule("*", "*", "allow"), rule("bash", "go test *", "allow")]
+  const out = await prepare({ command: "./check-gates.sh", provenance: availability("exec", other, [0]), trigger: parentAsk })
+  expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+})
+
+test("a session ceiling deny stays denied with eligible provenance", async () => {
+  const out = await prepare({
+    command: "./check-gates.sh",
+    sessionRules: [rule("bash", "*", "deny")],
+    provenance: availability("exec"),
+    trigger: parentAsk,
+  })
+  expect(verdict(out.ruleset, "./check-gates.sh")).toBe("deny")
+})
+
+test("an availability deny that disables bash entirely is never softened", async () => {
+  // `tools: {"*": false}` with no bash grant: the bash tool is unavailable, not merely narrowed.
+  for (const rules of [
+    [rule("*", "*", "allow"), rule("*", "*", "deny")],
+    [rule("*", "*", "allow"), rule("bash", "*", "deny")],
+  ]) {
+    expect(Permission.disabled(["bash"], rules).has("bash")).toBe(true)
+    const out = await prepare({ command: "./x", agentRules: rules, provenance: availability("exec", rules, [1]), trigger: parentAsk })
+    expect(verdict(out.ruleset, "./x")).toBe("deny")
+  }
+})
+
+test("a non-bash permission under the availability catch-all stays denied", async () => {
+  const out = await prepare({
+    command: "/tmp/x",
+    permission: "edit",
+    provenance: availability("exec"),
+    trigger: parentAsk,
+  })
+  expect(verdict(out.ruleset, "/tmp/x", "edit")).toBe("deny")
+})
+
+test("hook missing, throwing or answering deny keeps the eligible catch-all deny", async () => {
+  const missing = await prepare({ command: "./x", provenance: availability("exec") })
+  const thrown = await prepare({
+    command: "./x",
+    provenance: availability("exec"),
+    trigger: () => Effect.die(new Error("hook failed")),
+  })
+  const denied = await prepare({ command: "./x", provenance: availability("exec"), trigger: hook({ status: "deny" }) })
+  for (const out of [missing, thrown, denied]) expect(verdict(out.ruleset, "./x")).toBe("deny")
+})
+
+test("a hook allow never turns an eligible catch-all deny into an allow", async () => {
+  const out = await prepare({ command: "./x", provenance: availability("exec"), trigger: hook({ status: "allow" }) })
+  expect(verdict(out.ruleset, "./x")).not.toBe("allow")
+})
+
+// ---- Defect 2: annotations on an original ASK ----
+
+const askRules = [rule("*", "*", "allow"), rule("bash", "*", "ask")]
+
+test("a parent annotation on an original ask from a child is retained", async () => {
+  const out = await prepare({ command: "git push", agentRules: askRules, trigger: parentAsk })
+  expect(verdict(out.ruleset, "git push")).toBe("ask")
+  expect(out.approval).toEqual({ kind: "parent", sessionID: SessionID.make(ROOT) })
+  expect(out.forceAsk).toBe(true)
+  expect(out.always).toEqual([])
+})
+
+test("operator and human-only annotations on an original ask are retained", async () => {
+  const operator = await prepare({ command: "git push", agentRules: askRules, trigger: operatorAsk })
+  const human = await prepare({
+    command: "git push",
+    agentRules: askRules,
+    sessionID: ROOT,
+    trigger: hook({ status: "ask", approval: { kind: "human-only", sessionID: SessionID.make(ROOT) }, forceAsk: true }),
+  })
+  expect(operator.approval?.kind).toBe("operator")
+  expect(human.approval?.kind).toBe("human-only")
+  expect(operator.always).toEqual([])
+  expect(human.always).toEqual([])
+})
+
+test("a root cannot route its own ask to itself as parent", async () => {
+  const out = await prepare({ command: "git push", agentRules: askRules, sessionID: ROOT, trigger: parentAsk })
+  expect(verdict(out.ruleset, "git push")).toBe("ask")
+  expect(out.approval).toBeUndefined()
+})
+
+test("an annotation bound to another root is dropped", async () => {
+  const out = await prepare({
+    command: "git push",
+    agentRules: askRules,
+    trigger: hook({ status: "ask", approval: { kind: "operator", sessionID: SessionID.make("ses_other") }, forceAsk: true }),
+  })
+  expect(verdict(out.ruleset, "git push")).toBe("ask")
+  expect(out.approval).toBeUndefined()
+})
+
+test("forceAsk alone on an original ask is honored and clears always", async () => {
+  const out = await prepare({ command: "git push", agentRules: askRules, trigger: hook({ status: "ask", forceAsk: true }) })
+  expect(out.forceAsk).toBe(true)
+  expect(out.always).toEqual([])
+  expect(out.approval).toBeUndefined()
+})
+
+test("a plain hook ask on an original ask keeps the request's always patterns", async () => {
+  const out = await prepare({ command: "git push", agentRules: askRules, trigger: hook({ status: "ask" }) })
+  expect(out.forceAsk).toBe(false)
+  expect(out.always).toEqual(["git *"])
+})
+
+test("a hook allow on an original ask allows this request only", async () => {
+  const out = await prepare({ command: "git push", agentRules: askRules, sessionID: ROOT, trigger: hook({ status: "allow" }) })
+  expect(verdict(out.ruleset, "git push")).toBe("allow")
+  expect(out.approval).toBeUndefined()
+  expect(out.forceAsk).toBe(false)
+  // Nothing beyond the exact request pattern is granted.
+  expect(verdict(out.ruleset, "git push --force")).toBe("ask")
+})
+
+test("a hook allow never allows an original named deny", async () => {
+  const rules = [rule("*", "*", "allow"), rule("bash", "rm -rf /*", "deny")]
+  const out = await prepare({ command: "rm -rf /etc", agentRules: rules, sessionID: ROOT, trigger: hook({ status: "allow" }) })
+  expect(verdict(out.ruleset, "rm -rf /etc")).toBe("deny")
+})
+
+test("a hook allow never lifts a session ceiling deny", async () => {
+  const out = await prepare({
+    command: "git push",
+    agentRules: askRules,
+    sessionRules: [rule("bash", "git push", "deny")],
+    sessionID: ROOT,
+    trigger: hook({ status: "allow" }),
+  })
+  expect(verdict(out.ruleset, "git push")).toBe("deny")
+})
+
+test("a hook allow carrying an approval is inconsistent and stays a plain ask", async () => {
+  const out = await prepare({
+    command: "git push",
+    agentRules: askRules,
+    trigger: hook({ status: "allow", approval: { kind: "parent", sessionID: SessionID.make(ROOT) } }),
+  })
+  expect(verdict(out.ruleset, "git push")).toBe("ask")
+})
+
+test("a hook ask never turns an originally allowed request into a prompt", async () => {
+  const out = await prepare({ command: "ls", agentRules: [rule("*", "*", "allow")], trigger: parentAsk })
+  expect(verdict(out.ruleset, "ls")).toBe("allow")
+  expect(out.approval).toBeUndefined()
+})

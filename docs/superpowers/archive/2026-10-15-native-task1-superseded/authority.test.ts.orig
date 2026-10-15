@@ -1,0 +1,461 @@
+import { test, expect } from "bun:test"
+import { Effect } from "effect"
+import { Permission } from "../../src/permission"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { InstanceBootstrap } from "../../src/project/bootstrap"
+import { InstanceStore } from "../../src/project/instance-store"
+import { Deferred, Layer, Fiber } from "effect"
+import { testEffect } from "../lib/effect"
+import { SessionID } from "../../src/session/schema"
+
+const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+const env = AppNodeBuilder.build(
+  LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
+  [[InstanceStore.bootstrapNode, noopBootstrap]],
+)
+const it = testEffect(env)
+
+const waitForPending = (count: number) =>
+  Effect.gen(function* () {
+    const permission = yield* Permission.Service
+    return yield* Effect.gen(function* () {
+      while (true) {
+        const pending = yield* permission.list()
+        if (pending.length === count) return pending
+        yield* Effect.sleep("10 millis")
+      }
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: "1 second",
+        orElse: () => Effect.fail(new Error(`timed out waiting for ${count} pending permission request(s)`)),
+      }),
+    )
+  })
+
+const humanOnlyAsk = (root = "ses_root") =>
+  Effect.succeed({
+    status: "ask" as const,
+    approval: { kind: "human-only" as const, sessionID: SessionID.make(root) },
+    forceAsk: true,
+  })
+
+const globalNamedDeny = [{ permission: "bash", pattern: "rm -rf /*", action: "deny" as const }]
+
+const provenance = (input: {
+  capability: string | undefined
+  rules?: PermissionV1.Ruleset
+  globalPolicy?: ReadonlySet<number>
+}): Permission.AgentProvenance => ({
+  capability: input.capability,
+  rules: input.rules ?? globalNamedDeny,
+  availability: new Set(),
+  globalPolicy: input.globalPolicy ?? new Set([0]),
+})
+
+test("a global named denial for an exec seat becomes only an exact human-only ask", async () => {
+  const command = "rm -rf /home/dev/projects/disposable-fixture"
+  const prepared = await Effect.runPromise(
+    Permission.prepareForRequest({
+      req: {
+        permission: "bash",
+        patterns: [command],
+        always: ["rm *"],
+        metadata: { command, workdir: "/home/dev/projects" },
+      },
+      sessionID: "ses_leaf",
+      rootSessionID: "ses_root",
+      agentRules: globalNamedDeny,
+      sessionRules: [],
+      provenance: provenance({ capability: "exec" }),
+      trigger: () => humanOnlyAsk(),
+    }),
+  )
+
+  expect(prepared.approval?.kind).toBe("human-only")
+  expect(prepared.forceAsk).toBe(true)
+  expect(prepared.always).toEqual([])
+  expect(Permission.evaluate("bash", command, prepared.ruleset).action).toBe("ask")
+})
+
+test("a global named denial remains denied for a read seat", async () => {
+  const prepared = await Effect.runPromise(
+    Permission.prepareForRequest({
+      req: { permission: "bash", patterns: ["rm -rf /tmp/fixture"], always: [], metadata: {} },
+      sessionID: "ses_leaf",
+      rootSessionID: "ses_root",
+      agentRules: globalNamedDeny,
+      sessionRules: [],
+      provenance: provenance({ capability: "read" }),
+      trigger: () => humanOnlyAsk(),
+    }),
+  )
+
+  expect(Permission.evaluate("bash", "rm -rf /tmp/fixture", prepared.ruleset).action).toBe("deny")
+  expect(prepared.approval).toBeUndefined()
+})
+
+test("a role named denial that overrides global policy remains denied", async () => {
+  const rules = [...globalNamedDeny, { permission: "bash", pattern: "rm -rf /*", action: "deny" as const }]
+  const prepared = await Effect.runPromise(
+    Permission.prepareForRequest({
+      req: { permission: "bash", patterns: ["rm -rf /tmp/fixture"], always: [], metadata: {} },
+      sessionID: "ses_leaf",
+      rootSessionID: "ses_root",
+      agentRules: rules,
+      sessionRules: [],
+      provenance: provenance({ capability: "exec", rules }),
+      trigger: () => humanOnlyAsk(),
+    }),
+  )
+
+  expect(Permission.evaluate("bash", "rm -rf /tmp/fixture", prepared.ruleset).action).toBe("deny")
+  expect(prepared.approval).toBeUndefined()
+})
+
+test("a session ceiling remains denied even when the agent has a global named denial", async () => {
+  const prepared = await Effect.runPromise(
+    Permission.prepareForRequest({
+      req: { permission: "bash", patterns: ["rm -rf /tmp/fixture"], always: [], metadata: {} },
+      sessionID: "ses_leaf",
+      rootSessionID: "ses_root",
+      agentRules: globalNamedDeny,
+      sessionRules: [{ permission: "bash", pattern: "rm -rf /*", action: "deny" }],
+      provenance: provenance({ capability: "exec" }),
+      trigger: () => humanOnlyAsk(),
+    }),
+  )
+
+  expect(Permission.evaluate("bash", "rm -rf /tmp/fixture", prepared.ruleset).action).toBe("deny")
+  expect(prepared.approval).toBeUndefined()
+})
+
+test("a global named denial without provenance remains denied", async () => {
+  const prepared = await Effect.runPromise(
+    Permission.prepareForRequest({
+      req: { permission: "bash", patterns: ["rm -rf /tmp/fixture"], always: [], metadata: {} },
+      sessionID: "ses_leaf",
+      rootSessionID: "ses_root",
+      agentRules: globalNamedDeny,
+      sessionRules: [],
+      trigger: () => humanOnlyAsk(),
+    }),
+  )
+
+  expect(Permission.evaluate("bash", "rm -rf /tmp/fixture", prepared.ruleset).action).toBe("deny")
+  expect(prepared.approval).toBeUndefined()
+})
+
+test("a primary agent without a capability lets the human decide a global named denial", async () => {
+  const prepared = await Effect.runPromise(
+    Permission.prepareForRequest({
+      req: { permission: "bash", patterns: ["rm -rf /tmp/fixture"], always: ["rm *"], metadata: {} },
+      sessionID: "ses_leaf",
+      rootSessionID: "ses_root",
+      agentRules: globalNamedDeny,
+      sessionRules: [],
+      provenance: provenance({ capability: undefined }),
+      trigger: () => humanOnlyAsk(),
+    }),
+  )
+
+  expect(Permission.evaluate("bash", "rm -rf /tmp/fixture", prepared.ruleset).action).toBe("ask")
+  expect(prepared.approval?.kind).toBe("human-only")
+  expect(prepared.always).toEqual([])
+})
+
+test("missing or throwing hooks keep a named denial", async () => {
+  const request = {
+    permission: "bash",
+    patterns: ["rm -rf /tmp/fixture"],
+    always: [],
+    metadata: {},
+  }
+  const denied = await Effect.runPromise(
+    Permission.prepareForRequest({
+      req: request,
+      sessionID: "ses_leaf",
+      rootSessionID: "ses_root",
+      agentRules: [{ permission: "bash", pattern: "rm -rf /*", action: "deny" }],
+      sessionRules: [],
+    }),
+  )
+  const thrown = await Effect.runPromise(
+    Permission.prepareForRequest({
+      req: request,
+      sessionID: "ses_leaf",
+      rootSessionID: "ses_root",
+      agentRules: [{ permission: "bash", pattern: "rm -rf /*", action: "deny" }],
+      sessionRules: [],
+      trigger: () => Effect.die(new Error("hook failed")),
+    }),
+  )
+
+  expect(Permission.evaluate("bash", request.patterns[0], denied.ruleset).action).toBe("deny")
+  expect(Permission.evaluate("bash", request.patterns[0], thrown.ruleset).action).toBe("deny")
+})
+
+it.instance(
+  "generic replies cannot approve a human-only request but the private user reply can approve it once",
+  () =>
+    Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      const requestID = PermissionV1.ID.make("per_human_only")
+      const pending = yield* permission
+        .ask({
+          id: requestID,
+          sessionID: SessionID.make("ses_leaf"),
+          permission: "bash",
+          patterns: ["rm -rf /tmp/fixture"],
+          metadata: { command: "rm -rf /tmp/fixture", workdir: "/tmp" },
+          always: [],
+          approval: { kind: "human-only", sessionID: SessionID.make("ses_root") },
+          forceAsk: true,
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+        .pipe(Effect.forkScoped)
+
+      yield* Effect.sleep("10 millis")
+      const publicReply = yield* permission.reply({ requestID, reply: "once" }).pipe(Effect.exit)
+      expect(publicReply._tag).toBe("Failure")
+      expect((yield* permission.list())).toHaveLength(1)
+      yield* permission.replyFromUser({ requestID, reply: "once" })
+      yield* Fiber.join(pending)
+      const second = yield* permission.replyFromUser({ requestID, reply: "once" }).pipe(Effect.exit)
+      expect(second._tag).toBe("Failure")
+    }),
+  { git: true },
+)
+
+it.instance(
+  "always does not auto-settle human-only or parent approval requests",
+  () =>
+    Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      const sessionID = SessionID.make("ses_authority_leaf")
+      const ordinary = yield* permission
+        .ask({
+          id: PermissionV1.ID.make("per_authority_ordinary"),
+          sessionID,
+          permission: "bash",
+          patterns: ["echo ordinary"],
+          metadata: {},
+          always: ["*"],
+          ruleset: [],
+        })
+        .pipe(Effect.forkScoped)
+      const humanOnly = yield* permission
+        .ask({
+          id: PermissionV1.ID.make("per_authority_human"),
+          sessionID,
+          permission: "bash",
+          patterns: ["rm -rf /tmp/fixture"],
+          metadata: {},
+          always: [],
+          approval: { kind: "human-only", sessionID: SessionID.make("ses_authority_root") },
+          forceAsk: true,
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+        .pipe(Effect.forkScoped)
+      const parent = yield* permission
+        .ask({
+          id: PermissionV1.ID.make("per_authority_parent"),
+          sessionID,
+          permission: "bash",
+          patterns: ["git status"],
+          metadata: {},
+          always: [],
+          approval: { kind: "parent", sessionID: SessionID.make("ses_authority_root") },
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+        .pipe(Effect.forkScoped)
+
+      yield* waitForPending(3)
+      yield* permission.reply({ requestID: PermissionV1.ID.make("per_authority_ordinary"), reply: "always" })
+      yield* Fiber.join(ordinary)
+      expect((yield* permission.list()).map((request) => request.id).sort()).toEqual([
+        PermissionV1.ID.make("per_authority_human"),
+        PermissionV1.ID.make("per_authority_parent"),
+      ])
+
+      yield* permission.replyFromUser({ requestID: PermissionV1.ID.make("per_authority_human"), reply: "reject" })
+      yield* Fiber.await(humanOnly)
+      yield* Fiber.await(parent)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "always is rejected without settling annotated or forced requests, but works for ordinary requests",
+  () =>
+    Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      const events = yield* EventV2Bridge.Service
+      const replied: unknown[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type === Permission.Event.Replied.type) replied.push(event.data)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const requests = [
+        {
+          id: PermissionV1.ID.make("per_always_parent"),
+          approval: { kind: "parent" as const, sessionID: SessionID.make("ses_always_root") },
+        },
+        {
+          id: PermissionV1.ID.make("per_always_operator"),
+          approval: { kind: "operator" as const, sessionID: SessionID.make("ses_always_root") },
+        },
+        {
+          id: PermissionV1.ID.make("per_always_forced"),
+          forceAsk: true,
+        },
+      ]
+
+      for (const request of requests) {
+        const settled = yield* Deferred.make<void>()
+        const pending = yield* permission
+          .ask({
+            id: request.id,
+            sessionID: SessionID.make("ses_always_leaf"),
+            permission: "bash",
+            patterns: ["git status"],
+            metadata: {},
+            always: ["git *"],
+            ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+            ...("approval" in request ? { approval: request.approval } : {}),
+            ...("forceAsk" in request ? { forceAsk: request.forceAsk } : {}),
+        })
+          .pipe(Effect.tap(() => Deferred.succeed(settled, undefined)), Effect.forkScoped)
+
+        yield* waitForPending(1)
+        const repliedBefore = replied.length
+        const reply = yield* permission.reply({ requestID: request.id, reply: "always" }).pipe(Effect.exit)
+        expect(reply._tag).toBe("Failure")
+        expect((yield* permission.list()).map((item) => item.id)).toContain(request.id)
+        expect(yield* Deferred.isDone(settled)).toBe(false)
+        expect(replied.slice(repliedBefore)).toEqual([])
+
+        yield* permission.reply({ requestID: request.id, reply: "reject" })
+        yield* Fiber.await(pending)
+      }
+
+      const ordinaryID = PermissionV1.ID.make("per_always_ordinary")
+      const ordinarySettled = yield* Deferred.make<void>()
+      const ordinary = yield* permission
+        .ask({
+          id: ordinaryID,
+          sessionID: SessionID.make("ses_always_leaf"),
+          permission: "bash",
+          patterns: ["git status"],
+          metadata: {},
+          always: ["git *"],
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+        .pipe(Effect.tap(() => Deferred.succeed(ordinarySettled, undefined)), Effect.forkScoped)
+
+      yield* waitForPending(1)
+      const repliedBefore = replied.length
+      yield* permission.reply({ requestID: ordinaryID, reply: "always" })
+      yield* Fiber.join(ordinary)
+      expect(yield* Deferred.isDone(ordinarySettled)).toBe(true)
+      expect(replied.slice(repliedBefore)).toEqual([
+        expect.objectContaining({ requestID: ordinaryID, reply: "always" }),
+      ])
+    }),
+  { git: true },
+)
+
+it.instance(
+  "always does not cascade to another forced request in the same session",
+  () =>
+    Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      const sessionID = SessionID.make("ses_always_forced_cascade")
+      const forcedID = PermissionV1.ID.make("per_always_forced_cascade")
+      const ordinaryID = PermissionV1.ID.make("per_always_ordinary_cascade")
+
+      const forced = yield* permission
+        .ask({
+          id: forcedID,
+          sessionID,
+          permission: "bash",
+          patterns: ["git status"],
+          metadata: {},
+          always: ["git *"],
+          forceAsk: true,
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+        .pipe(Effect.forkScoped)
+      const ordinary = yield* permission
+        .ask({
+          id: ordinaryID,
+          sessionID,
+          permission: "bash",
+          patterns: ["git log"],
+          metadata: {},
+          always: ["git *"],
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+        .pipe(Effect.forkScoped)
+
+      yield* waitForPending(2)
+      yield* permission.reply({ requestID: ordinaryID, reply: "always" })
+      yield* Fiber.join(ordinary)
+      expect((yield* permission.list()).map((request) => request.id)).toEqual([forcedID])
+
+      yield* permission.reply({ requestID: forcedID, reply: "reject" })
+      yield* Fiber.await(forced)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "asks expose persistable always patterns only for ordinary requests",
+  () =>
+    Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      const requests = [
+        {
+          id: PermissionV1.ID.make("per_always_patterns_forced"),
+          forceAsk: true,
+          expectedAlways: [],
+        },
+        {
+          id: PermissionV1.ID.make("per_always_patterns_annotated"),
+          approval: { kind: "operator" as const, sessionID: SessionID.make("ses_always_patterns_root") },
+          expectedAlways: [],
+        },
+        {
+          id: PermissionV1.ID.make("per_always_patterns_ordinary"),
+          expectedAlways: ["git *"],
+        },
+      ]
+
+      for (const request of requests) {
+        const pending = yield* permission
+          .ask({
+            id: request.id,
+            sessionID: SessionID.make("ses_always_patterns_leaf"),
+            permission: "bash",
+            patterns: ["git status"],
+            metadata: {},
+            always: ["git *"],
+            ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+            ...("approval" in request ? { approval: request.approval } : {}),
+            ...("forceAsk" in request ? { forceAsk: request.forceAsk } : {}),
+          })
+          .pipe(Effect.forkScoped)
+
+        const [listed] = yield* waitForPending(1)
+        expect(listed.always).toEqual(request.expectedAlways)
+        yield* permission.reply({ requestID: request.id, reply: "reject" })
+        yield* Fiber.await(pending)
+      }
+    }),
+  { git: true },
+)

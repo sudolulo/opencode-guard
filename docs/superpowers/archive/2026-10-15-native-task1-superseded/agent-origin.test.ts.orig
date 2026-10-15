@@ -1,0 +1,220 @@
+import { expect, test } from "bun:test"
+import { Schema } from "effect"
+import { ConfigAgentV1 } from "../../src/v1/config/agent"
+import { ConfigAgentOrigin } from "../../src/v1/config/agent-origin"
+
+const decode = (input: unknown) => {
+  const attach = ConfigAgentOrigin.captureAgent(input)
+  const result = Schema.decodeUnknownSync(ConfigAgentV1.Info)(input, { propertyOrder: "original" })
+  attach(result)
+  return result
+}
+
+test("raw capture survives structural schema clones without changing permission values or order", () => {
+  const agent = decode({ tools: { "*": false }, permission: { bash: { "git *": "allow" } } })
+  expect(agent.permission).toEqual({ "*": "deny", bash: { "git *": "allow" } })
+  expect(Object.keys(agent.permission ?? {})).toEqual(["*", "bash"])
+  expect([...ConfigAgentOrigin.toolsDenies(agent.permission)]).toEqual(["*"])
+})
+
+test("explicit policy never acquires tools origin from an equal folded value", () => {
+  const agent = decode({ tools: { "*": false }, permission: { "*": "deny", bash: { "git *": "allow" } } })
+  expect(agent.permission).toEqual({ "*": "deny", bash: { "git *": "allow" } })
+  expect([...ConfigAgentOrigin.toolsDenies(agent.permission)]).toEqual([])
+})
+
+test("all-action origin includes tools allows but excludes equal explicit allows", () => {
+  const pure = decode({ tools: { "b*": true, "ba*": false } })
+  expect([...ConfigAgentOrigin.toolsRules(pure.permission)]).toEqual(["b*", "ba*"])
+  expect([...ConfigAgentOrigin.toolsDenies(pure.permission)]).toEqual(["ba*"])
+  const policy = decode({ tools: { "b*": true, "ba*": false }, permission: { "b*": "allow" } })
+  expect([...ConfigAgentOrigin.toolsRules(policy.permission)]).toEqual(["ba*"])
+})
+
+for (const scenario of [
+  { tools: { write: false }, explicit: {}, permission: { edit: "deny" }, origins: ["edit"] },
+  { tools: { edit: false }, explicit: {}, permission: { edit: "deny" }, origins: ["edit"] },
+  { tools: { patch: false }, explicit: {}, permission: { edit: "deny" }, origins: ["edit"] },
+  { tools: { write: false, patch: true }, explicit: {}, permission: { edit: "allow" }, origins: [] },
+  { tools: { patch: true, write: false }, explicit: {}, permission: { edit: "deny" }, origins: ["edit"] },
+  { tools: { write: false }, explicit: { edit: "deny" }, permission: { edit: "deny" }, origins: [] },
+  { tools: { patch: false }, explicit: { edit: { "private/*": "deny" } }, permission: { edit: { "private/*": "deny" } }, origins: [] },
+] as const) {
+  test(`alias origins follow real normalization: ${JSON.stringify(scenario.tools)} / ${JSON.stringify(scenario.explicit)}`, () => {
+    const agent = decode({ tools: scenario.tools, permission: scenario.explicit })
+    expect(agent.permission).toEqual(scenario.permission)
+    expect([...ConfigAgentOrigin.toolsDenies(agent.permission)]).toEqual([...scenario.origins])
+  })
+}
+
+test("capture cannot be forged by public provenance fields and decoded clones are fail-closed", () => {
+  const agent = decode({
+    capability: "exec",
+    tools: { "*": false },
+    permission: { "*": "deny", bash: { "git *": "allow" } },
+    availability: ["*"],
+    provenance: { availability: ["*"] },
+  })
+  expect([...ConfigAgentOrigin.toolsDenies(agent.permission)]).toEqual([])
+  expect([...ConfigAgentOrigin.toolsDenies(structuredClone(agent).permission)]).toEqual([])
+})
+
+// Mirrors the config loader's remeda mergeDeep: records merge recursively, anything else
+// is replaced by the source value. Each step transfers origin exactly as config.ts does.
+const record = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+const mergeDeep = (target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> => {
+  const out: Record<string, unknown> = { ...target }
+  for (const [key, value] of Object.entries(source)) {
+    const previous = out[key]
+    out[key] = record(previous) && record(value) ? mergeDeep(previous, value) : value
+  }
+  return out
+}
+type Agent = ReturnType<typeof decode>
+const chain = (...layers: Agent[]) =>
+  layers.reduce((target, source) => {
+    const result = mergeDeep(target, source) as Agent
+    ConfigAgentOrigin.transfer(target.permission, source.permission, result.permission)
+    return result
+  })
+
+test("tools-only overlays cannot revoke an explicit named deny across a chain", () => {
+  const result = chain(
+    decode({ permission: { "*": { "rm *": "deny" } } }),
+    decode({ tools: { "*": true } }),
+    decode({ tools: { "*": false }, permission: { bash: { "git *": "allow" } } }),
+  )
+  expect(result.permission).toEqual({ "*": "deny", bash: { "git *": "allow" } })
+  expect([...ConfigAgentOrigin.toolsRules(result.permission)]).not.toContain("*")
+})
+
+test("tools-only overlays cannot revoke an explicit scalar deny across a chain", () => {
+  const result = chain(
+    decode({ permission: { "b*": "deny" } }),
+    decode({ tools: { "b*": true } }),
+    decode({ tools: { "b*": false }, permission: { bash: { "git *": "allow" } } }),
+  )
+  expect(result.permission).toEqual({ "b*": "deny", bash: { "git *": "allow" } })
+  expect([...ConfigAgentOrigin.toolsRules(result.permission)]).not.toContain("b*")
+})
+
+test("an explicit later write replaces an explicit deny without leaving taint", () => {
+  const replaced = chain(
+    decode({ permission: { "*": { "rm *": "deny" } } }),
+    decode({ permission: { "*": "allow" } }),
+    decode({ tools: { "*": false }, permission: { bash: { "git *": "allow" } } }),
+  )
+  expect(replaced.permission).toEqual({ "*": "deny", bash: { "git *": "allow" } })
+  expect([...ConfigAgentOrigin.toolsRules(replaced.permission)]).toEqual(["*"])
+  const cleared = chain(
+    decode({ permission: { "*": { "rm *": "deny" } } }),
+    decode({ tools: { "*": true } }),
+    decode({ permission: { "*": "allow" } }),
+    decode({ tools: { "*": false }, permission: { bash: { "git *": "allow" } } }),
+  )
+  expect(cleared.permission).toEqual({ "*": "deny", bash: { "git *": "allow" } })
+  expect([...ConfigAgentOrigin.toolsRules(cleared.permission)]).toEqual(["*"])
+})
+
+test("a tools-only chain with no explicit deny keeps availability origin", () => {
+  const result = chain(
+    decode({ tools: { "*": true } }),
+    decode({ tools: { "*": false }, permission: { bash: { "git *": "allow" } } }),
+  )
+  expect([...ConfigAgentOrigin.toolsRules(result.permission)]).toEqual(["*"])
+})
+
+// A merged permission used as the SOURCE of a later merge (config.ts mode -> agent).
+// Its own tools-over-deny taint must travel with it, not be read as an explicit write.
+const composite = () => chain(decode({ permission: { "*": "deny" } }), decode({ tools: { "*": true } }))
+
+for (const [name, base] of [
+  ["absent target permission (result is the source object)", () => decode({})],
+  ["target permission lacking the key", () => decode({ permission: { read: "allow" } })],
+] as const) {
+  test(`a tainted composite source keeps its taint through a later tools-only overlay: ${name}`, () => {
+    const source = composite()
+    expect(source.permission).toEqual({ "*": "allow" })
+    expect([...ConfigAgentOrigin.toolsRules(source.permission)]).toEqual([])
+    const result = chain(base(), source, decode({ tools: { "*": false } }))
+    expect(result.permission?.["*"]).toBe("deny")
+    expect([...ConfigAgentOrigin.toolsRules(result.permission)]).not.toContain("*")
+  })
+}
+
+test("an explicit write after a tainted composite source still clears the taint", () => {
+  const result = chain(
+    decode({}),
+    composite(),
+    decode({ permission: { "*": "allow" } }),
+    decode({ tools: { "*": false } }),
+  )
+  expect(result.permission).toEqual({ "*": "deny" })
+  expect([...ConfigAgentOrigin.toolsRules(result.permission)]).toEqual(["*"])
+})
+
+for (const [name, unrelated] of [
+  ["permission without the key", () => decode({ permission: { read: "allow" } })],
+  ["no permission at all", () => decode({ description: "unrelated" })],
+] as const) {
+  test(`taint is inherited through a layer lacking the key: ${name}`, () => {
+    const result = chain(
+      decode({ permission: { "b*": "deny" } }),
+      decode({ tools: { "b*": true } }),
+      unrelated(),
+      decode({ tools: { "b*": false } }),
+    )
+    expect(result.permission?.["b*"]).toBe("deny")
+    expect([...ConfigAgentOrigin.toolsRules(result.permission)]).not.toContain("b*")
+  })
+}
+
+test("taint survives a five-layer tools-only chain", () => {
+  const result = chain(
+    decode({ permission: { "b*": "deny" } }),
+    decode({ tools: { "b*": true } }),
+    decode({ tools: { "b*": false } }),
+    decode({ tools: { "b*": true } }),
+    decode({ tools: { "b*": false } }),
+  )
+  expect(result.permission).toEqual({ "b*": "deny" })
+  expect([...ConfigAgentOrigin.toolsRules(result.permission)]).not.toContain("b*")
+})
+
+test("edit alias tools keys cannot revoke an explicit edit deny across a chain", () => {
+  const result = chain(
+    decode({ permission: { edit: "deny" } }),
+    decode({ tools: { write: true } }),
+    decode({ tools: { patch: false } }),
+  )
+  expect(result.permission).toEqual({ edit: "deny" })
+  expect([...ConfigAgentOrigin.toolsRules(result.permission)]).not.toContain("edit")
+  const cleared = chain(
+    decode({ permission: { edit: "deny" } }),
+    decode({ tools: { write: true } }),
+    decode({ permission: { edit: "allow" } }),
+    decode({ tools: { patch: false } }),
+  )
+  expect(cleared.permission).toEqual({ edit: "deny" })
+  expect([...ConfigAgentOrigin.toolsRules(cleared.permission)]).toEqual(["edit"])
+})
+
+test("encoding and decoding retain baseline values and order without serializing trust", () => {
+  const agent = decode({ name: "display", capability: "exec", tools: { "*": false }, permission: { bash: { "git *": "allow" } } })
+  const encoded = Schema.encodeSync(ConfigAgentV1.Info)(agent, { propertyOrder: "original" })
+  expect(encoded).toEqual({
+    name: "display",
+    capability: "exec",
+    tools: { "*": false },
+    permission: { "*": "deny", bash: { "git *": "allow" } },
+    options: { capability: "exec" },
+  })
+  expect(Object.keys(encoded.permission ?? {})).toEqual(["*", "bash"])
+  expect(Object.getOwnPropertySymbols(agent)).toEqual([])
+  expect(Object.getOwnPropertySymbols(agent.permission!)).toEqual([])
+  const again = decode(JSON.parse(JSON.stringify(encoded)))
+  expect(again).toEqual(agent)
+  expect([...ConfigAgentOrigin.toolsDenies(again.permission)]).toEqual([])
+  expect([...ConfigAgentOrigin.toolsDenies(agent.permission)]).toEqual(["*"])
+})

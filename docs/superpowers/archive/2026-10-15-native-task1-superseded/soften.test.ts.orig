@@ -1,0 +1,169 @@
+import { test, expect } from "bun:test"
+import { Effect } from "effect"
+import { Permission } from "../../src/permission"
+import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
+
+const rule = (permission: string, pattern: string, action: "allow" | "deny" | "ask"): PermissionV1.Rule => ({
+  permission,
+  pattern,
+  action,
+})
+
+// The shape `tools: {"*": false}` produces, then a seat's exact allowlist and one named deny.
+const catchAll = rule("*", "*", "deny")
+const agentRules = [catchAll, rule("bash", "go test *", "allow"), rule("bash", "rm -rf /*", "deny")]
+// Index 0 came from the exec seat's tool availability map, not from explicit permission policy.
+const provenance = (rules: PermissionV1.Rule[], capability = "exec"): Permission.AgentProvenance => ({
+  capability,
+  rules,
+  availability: new Set([0]),
+  globalPolicy: new Set(),
+})
+
+const run = (patterns: string[], hook: () => Effect.Effect<"ask" | "deny" | "allow">, sessionRules: PermissionV1.Rule[] = [], permission = "bash") =>
+  Effect.runSync(Permission.softenCatchAll({ permission, patterns, agentRules, sessionRules, provenance: provenance(agentRules), hook }))
+
+const verdict = (ruleset: PermissionV1.Rule[], pattern: string, permission = "bash") =>
+  Permission.evaluate(permission, pattern, ruleset).action
+
+test("a catch-all bash deny becomes an ask when the hook says ask", () => {
+  let calls = 0
+  const out = run(["./check-gates.sh"], () => Effect.sync(() => (calls++, "ask" as const)))
+  expect(calls).toBe(1)
+  expect(verdict(out, "./check-gates.sh")).toBe("ask")
+})
+
+test("allow from the hook is capped at ask", () => {
+  const out = run(["./check-gates.sh"], () => Effect.succeed("allow" as const))
+  expect(verdict(out, "./check-gates.sh")).toBe("ask")
+})
+
+test("deny, a throwing hook and a failing hook all leave the deny", () => {
+  expect(verdict(run(["./x"], () => Effect.succeed("deny" as const)), "./x")).toBe("deny")
+  expect(verdict(run(["./x"], () => Effect.die(new Error("boom"))), "./x")).toBe("deny")
+  expect(verdict(run(["./x"], () => Effect.fail("no") as never), "./x")).toBe("deny")
+})
+
+test("a named deny never consults the hook, even beside a catch-all-denied segment", () => {
+  let calls = 0
+  const hook = () => Effect.sync(() => (calls++, "ask" as const))
+  expect(verdict(run(["rm -rf /etc"], hook), "rm -rf /etc")).toBe("deny")
+  const mixed = run(["ls", "rm -rf /etc"], hook)
+  expect(verdict(mixed, "ls")).toBe("deny")
+  expect(verdict(mixed, "rm -rf /etc")).toBe("deny")
+  expect(calls).toBe(0)
+})
+
+test("a permission other than bash never consults the hook", () => {
+  let calls = 0
+  run(["/some/file"], () => Effect.sync(() => (calls++, "ask" as const)), [], "edit")
+  expect(calls).toBe(0)
+})
+
+test("a catch-all deny from the SESSION (a parent ceiling) is never softened", () => {
+  let calls = 0
+  const sessionCeiling = [rule("bash", "*", "deny")]
+  const out = run(["go test ./..."], () => Effect.sync(() => (calls++, "ask" as const)), sessionCeiling)
+  expect(calls).toBe(0)
+  expect(verdict(out, "go test ./...")).toBe("deny")
+})
+
+test("an allowed command never consults the hook and keeps its allow", () => {
+  let calls = 0
+  const out = run(["go test ./..."], () => Effect.sync(() => (calls++, "ask" as const)))
+  expect(calls).toBe(0)
+  expect(verdict(out, "go test ./...")).toBe("allow")
+})
+
+test("catchAllDenied lists only patterns denied by an agent availability catch-all", () => {
+  const trusted = provenance(agentRules)
+  expect(Permission.catchAllDenied("bash", ["./a", "go test x"], agentRules, [], trusted)).toEqual(["./a"])
+  expect(Permission.catchAllDenied("bash", ["./a", "rm -rf /x"], agentRules, [], trusted)).toEqual([])
+  expect(Permission.catchAllDenied("edit", ["./a"], agentRules, [], trusted)).toEqual([])
+})
+
+test("catchAllDenied is empty without provenance or for a read seat", () => {
+  expect(Permission.catchAllDenied("bash", ["./a"], agentRules, [])).toEqual([])
+  expect(Permission.catchAllDenied("bash", ["./a"], agentRules, [], provenance(agentRules, "read"))).toEqual([])
+})
+
+test("refuses softening when a literal command pattern would change an allowed verdict", () => {
+  const rules = [rule("bash", "*", "deny"), rule("bash", "echo safe", "allow")]
+  const out = Effect.runSync(
+    Permission.softenCatchAll({
+      permission: "bash",
+      patterns: ["echo *", "echo safe"],
+      agentRules: rules,
+      sessionRules: [],
+      provenance: provenance(rules),
+      hook: () => Effect.succeed("ask" as const),
+    }),
+  )
+
+  expect(verdict(out, "echo *")).toBe("deny")
+  expect(verdict(out, "echo safe")).toBe("allow")
+})
+
+test("softens a wildcard command pattern when it changes no other request verdict", () => {
+  const out = Effect.runSync(
+    Permission.softenCatchAll({
+      permission: "bash",
+      patterns: ["echo ?"],
+      agentRules: [catchAll, rule("bash", "go test *", "allow")],
+      sessionRules: [],
+      provenance: provenance([catchAll, rule("bash", "go test *", "allow")]),
+      hook: () => Effect.succeed("ask" as const),
+    }),
+  )
+
+  expect(verdict(out, "echo ?")).toBe("ask")
+})
+
+test("the permission.ask trigger supplies an ask ruleset only when the plugin asks", async () => {
+  const request = {
+    permission: "bash",
+    patterns: ["./check-gates.sh"],
+    always: ["./check-gates.sh"],
+    metadata: {},
+  }
+  let received: unknown
+  const ask = Effect.runSync(
+    Permission.softenForRequest({
+      req: request,
+      sessionID: "ses_test",
+      agentRules,
+      sessionRules: [],
+      provenance: provenance(agentRules),
+      trigger: (input, output) =>
+        Effect.sync(() => {
+          received = input
+          output.status = "ask"
+          return output
+        }),
+    }),
+  )
+  const throwing = await Effect.runPromise(
+    Permission.softenForRequest({
+      req: request,
+      sessionID: "ses_test",
+      agentRules,
+      sessionRules: [],
+      provenance: provenance(agentRules),
+      trigger: () => Effect.promise(() => Promise.reject(new Error("boom"))),
+    }),
+  )
+  const absent = Effect.runSync(
+    Permission.softenForRequest({
+      req: request,
+      sessionID: "ses_test",
+      agentRules,
+      sessionRules: [],
+      provenance: provenance(agentRules),
+    }),
+  )
+
+  expect(received).toEqual({ ...request, sessionID: "ses_test" })
+  expect(verdict(ask, "./check-gates.sh")).toBe("ask")
+  expect(verdict(throwing, "./check-gates.sh")).toBe("deny")
+  expect(verdict(absent, "./check-gates.sh")).toBe("deny")
+})

@@ -299,7 +299,7 @@ Suites, bun 1.4.2 package-local and node for the guard: native `packages/opencod
 - A23: guard "A23 unattended: ...", "A23 level off: ...".
 - A24: guard authority "a god root approves its child's current parent approval once", "a god root rejects its child's current parent approval; native receives reply reject" (added), and the cross-root, stale and mode-change tests.
 
-Known gaps, recorded: `bg_run` / `pty_spawn` floors still throw for god descendants (no native ask); legacy log lines still carry raw commands; no real host or TUI proof until a build is authorized.
+Closed 2026-10-15: `bg_run` / `pty_spawn` refusals are routed through a native ask requested by the before-hook (capability `beforeAsk: 1`). `opencode-pty`'s own config check inside the tool still refuses config "ask" commands itself. Known gaps, recorded: legacy log lines still carry raw commands; no real host or TUI proof until a build is authorized.
 
 ## 9. Sequencing, open decisions, uncertainties
 

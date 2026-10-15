@@ -194,6 +194,10 @@ const armsReveal = (command) => /\boc-reveal\b/.test(command) || /\.config\/open
 // Native-asking tools -> the permission each one asks for. Only these guarantee a native ask,
 // so only these may defer a guard floor from tool.execute.before to the permission hook.
 const DEFERRABLE = { bash: "bash", read: "read", glob: "glob", grep: "grep", edit: "edit", write: "edit" };
+// Process tools that never ask natively. On a host advertising beforeAsk, the guard asks native
+// for an exact `bash` ask on the call (tool.execute.before output.ask), which makes them
+// deferrable exactly like bash: their floors and root-policy routes reach the permission hook.
+const ASKABLE = { bg_run: "bash", pty_spawn: "bash" };
 // A deferred effect is correlated by its exact native call. Any part missing means there is
 // no safe key, never the shared string "undefined".
 const escalationKey = (sessionID, callID, permission) =>
@@ -1353,9 +1357,9 @@ const modeFor = async (sessionID) => {
       // judged as the root's own, so the ROOT's effective bash deny routes the call (named ->
       // human-once, catch-all -> explicit deny) even where the session's own rules allow it;
       // under a god root it is a parent ask. See lib/escalation.js for the table.
-      // KNOWN GAP (design 9, default 4; follow-up owner: lead): non-deferrable process tools
-      // (pty_spawn, bg_run, ...) do not guarantee a native ask, so their refusals still throw
-      // for god descendants, exactly as before.
+      // Process tools that never ask natively (bg_run, pty_spawn) are routed the same way on a
+      // host advertising beforeAsk (ASKABLE): the guard requests an exact native ask for the call.
+      // Older hosts keep the throws below.
       // Unattended sessions, level `off` and old hosts keep the legacy sequence below:
       // no escalation and no override. ATTENDED ONLY: the mode was set in front of a person,
       // in one session, and that is the whole grant -- `opencode run --session <id>`
@@ -1398,12 +1402,19 @@ const modeFor = async (sessionID) => {
       };
       if (ctx) {
         if (ctx.isRoot && ctx.rootMode === "god") { log("allow(god)", command ?? input?.tool); return; }
-        const permissionKey = DEFERRABLE[input?.tool];
+        // A process tool becomes deferrable only when native will ask for it (beforeAsk) and the
+        // guard has its command line to ask about.
+        const viaAsk = !DEFERRABLE[input?.tool] && ctx.beforeAsk === true && Boolean(command) && ASKABLE[input?.tool];
+        const permissionKey = DEFERRABLE[input?.tool] ?? (viaAsk ? ASKABLE[input.tool] : undefined);
+        // Every way such a call is let through below must carry the ask, or its hook never fires.
+        const requestAsk = () => {
+          if (viaAsk) output.ask = { permission: permissionKey, patterns: [command], metadata: { command, tool: input.tool } };
+        };
         if (permissionKey) {
           const key = escalationKey(input.sessionID, input?.callID, permissionKey);
           const godChild = !ctx.isRoot && ctx.rootMode === "god";
           // The call is let through: keep its identity for its permission hooks.
-          const proceed = () => keepCall();
+          const proceed = () => { requestAsk(); keepCall(); };
           // The reason and the log carry the floor's class, never the command: native request
           // metadata already shows the exact command to whoever answers.
           const defer = (kind, cls) => {
@@ -1412,6 +1423,7 @@ const modeFor = async (sessionID) => {
               sessionID: input.sessionID, root: ctx.rootSessionID, mode: ctx.rootMode, binding,
             });
             log(`stash(${kind}/${cls})`, `${permissionKey} in ${input.sessionID} call ${String(input.callID).slice(0, 64)}`);
+            requestAsk();
             keepCall();
           };
           // The guard's own switches and the reveal window: a person sets those. A god
@@ -1452,6 +1464,7 @@ const modeFor = async (sessionID) => {
               sessionID: input.sessionID, root: ctx.rootSessionID, mode: ctx.rootMode, binding,
             });
             log(`route(root-policy/${rootDeny})`, `${permissionKey} in ${input.sessionID} call ${String(input.callID).slice(0, 64)}`);
+            requestAsk();
             keepCall();
             return;
           }
@@ -1466,7 +1479,7 @@ const modeFor = async (sessionID) => {
             return;
           }
           if (refusal.promptable) {
-            if (ctx.isRoot) return; // the root's native prompt, as before
+            if (ctx.isRoot) { requestAsk(); return; } // the root's native prompt, as before
             if (key && binding) {
               defer("human-only", refusal.class);
               return;
@@ -1556,7 +1569,7 @@ const modeFor = async (sessionID) => {
       // Above the level check: the floor was deferred while the guard was on.
       // Completion also frees the call's slot (live stash or expired tombstone) and drops its
       // call context: both are single-use and belong to this call only.
-      const missedKey = escalationKey(input?.sessionID, input?.callID, DEFERRABLE[input?.tool]);
+      const missedKey = escalationKey(input?.sessionID, input?.callID, DEFERRABLE[input?.tool] ?? ASKABLE[input?.tool]);
       const contextKey = callKey(input?.sessionID, input?.callID);
       if (contextKey) callContexts.delete(contextKey);
       // A FAILED call (native marks a tool that threw or was interrupted after its before-hook)

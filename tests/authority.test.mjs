@@ -162,9 +162,9 @@ test("an old host without the authority capability fails closed before promotion
 test("rootContext resolves root and mode on a v2 host and classifies v1 as an old host", async () => {
   const v2 = v2Client();
   const broker = createAuthorityBroker({ v2, directory: "/work", tree, rootMode: () => "god" });
-  assert.deepEqual(await broker.rootContext("ses_child"), { rootSessionID: "ses_root", rootMode: "god", isRoot: false });
-  assert.deepEqual(await broker.rootContext("ses_root"), { rootSessionID: "ses_root", rootMode: "god", isRoot: true });
-  assert.deepEqual(await broker.rootContext("ses_other"), { rootSessionID: "ses_other", rootMode: "god", isRoot: true });
+  assert.deepEqual(await broker.rootContext("ses_child"), { rootSessionID: "ses_root", rootMode: "god", isRoot: false, beforeAsk: false });
+  assert.deepEqual(await broker.rootContext("ses_root"), { rootSessionID: "ses_root", rootMode: "god", isRoot: true, beforeAsk: false });
+  assert.deepEqual(await broker.rootContext("ses_other"), { rootSessionID: "ses_other", rootMode: "god", isRoot: true, beforeAsk: false });
   for (const permissionAuthority of [1, undefined]) {
     const old = createAuthorityBroker({ v2: v2Client({ capabilities: { permissionAuthority, backgroundSubagents: true } }), directory: "/work", tree, rootMode: () => "god" });
     await assert.rejects(old.rootContext("ses_child"), (error) => error.code === AUTHORITY_UNSUPPORTED);

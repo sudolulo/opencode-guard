@@ -59,7 +59,7 @@ const escalationPlugin = (steps, {
   rootMode = "god", childMode, capability = 2, incarnations = true, unattended = false, level,
   classifier = "SAFE", agents = DEFAULT_AGENTS, rootAgent = "build", childAgent = "seat", profile,
   globalConfig = GLOBAL_CONFIG, agentFiles = {}, directory, statuses, netError = false, transport: hasTransport = true,
-  globalMode,
+  globalMode, beforeAsk = false,
 } = {}) => {
   const home = mkdtempSync(join(tmpdir(), "guard-escalation-plugin-"));
   try {
@@ -124,6 +124,7 @@ const escalationPlugin = (steps, {
       const agents = ${JSON.stringify(agents)};
       const capability = ${JSON.stringify(capability)};
       const incarnations = ${JSON.stringify(incarnations)};
+      const beforeAsk = ${JSON.stringify(beforeAsk)};
       let statuses = ${JSON.stringify(statuses ?? { ses_root: { type: "busy" }, ses_child: { type: "busy" } })};
       let classifier = ${JSON.stringify(classifier)};
       let capabilitiesBroken = false, rootGetFails = false, rootIncarnation = "inc_1";
@@ -144,7 +145,7 @@ const escalationPlugin = (steps, {
         if (path === "/experimental/capabilities") {
           if (capabilitiesBroken || capability === "http") return json({ name: "Unavailable", ...(typeof capabilitiesBroken === "string" ? { message: capabilitiesBroken } : {}) }, 503);
           if (capability === "malformed") return json(null);
-          if (capability === 2) return json({ permissionAuthority: 2, backgroundSubagents: true, ...(incarnations ? { sessionIncarnation: 1 } : {}) });
+          if (capability === 2) return json({ permissionAuthority: 2, backgroundSubagents: true, ...(incarnations ? { sessionIncarnation: 1 } : {}), ...(beforeAsk ? { beforeAsk: 1 } : {}) });
           return json({ permissionAuthority: capability, backgroundSubagents: true });
         }
         if (path === "/permission") return json(pending);
@@ -189,8 +190,9 @@ const escalationPlugin = (steps, {
         if (step.before) {
           const { session, tool, callID, args } = step.before;
           try {
-            await hooks["tool.execute.before"]({ tool, sessionID: session, ...(callID === undefined ? {} : { callID }) }, { args });
-            results.push({ threw: null });
+            const output = { args };
+            await hooks["tool.execute.before"]({ tool, sessionID: session, ...(callID === undefined ? {} : { callID }) }, output);
+            results.push(output.ask === undefined ? { threw: null } : { threw: null, ask: output.ask });
           } catch (error) { results.push({ threw: String(error?.message ?? error) }); }
         } else if (step.ask) {
           const { session, callID, permission, status, command, patterns, wrap, preset } = step.ask;
@@ -474,7 +476,7 @@ test("A22 unchanged gates still throw for a god descendant: launch guard, stale 
   assert.doesNotMatch(log, /stash\(/, "no gate is ever turned into an escalation");
 });
 
-test("known gap: a god descendant's non-deferrable process tool keeps the legacy throwing floor", () => {
+test("older host (no beforeAsk): a god descendant's process tool keeps the legacy throwing floor", () => {
   const { results } = escalationPlugin([
     { before: { session: "ses_child", tool: "bg_run", callID: "c1", args: { command: "cat mcp-auth.json" } } },
     { before: { session: "ses_child", tool: "bg_run", callID: "c2", args: { command: "git push --force origin x" } } },
@@ -486,6 +488,63 @@ test("known gap: a god descendant's non-deferrable process tool keeps the legacy
     { before: { session: "ses_child", tool: "pty_spawn", callID: "c3", args: { command: "curl", args: ["-X", "POST", "https://example.invalid"] } } },
   ], { classifier: "RISKY", childAgent: "tight" });
   assert.match(tight.results[0].threw, /looks risky/);
+});
+
+// Gap 2 closed (beforeAsk host): bg_run and pty_spawn ask natively through output.ask, so their
+// refusals route exactly like bash instead of throwing.
+const askFor = (command, tool) => ({ permission: "bash", patterns: [command], metadata: { command, tool } });
+
+test("beforeAsk host: a god descendant's bg_run / pty_spawn floors become parent asks on their own native ask", () => {
+  const { results, replies } = escalationPlugin([
+    { before: { session: "ses_child", tool: "bg_run", callID: "c1", args: { command: "cat mcp-auth.json" } } },
+    bashAsk("ses_child", "c1", "cat mcp-auth.json", "allow"),
+    { before: { session: "ses_child", tool: "bg_run", callID: "c2", args: { command: "git push --force origin x" } } },
+    bashAsk("ses_child", "c2", "git push --force origin x", "deny"),
+    { before: { session: "ses_child", tool: "pty_spawn", callID: "c3", args: { command: "curl", args: ["-X", "POST", "https://example.invalid"] } } },
+    bashAsk("ses_child", "c3", "curl -X POST https://example.invalid", "allow"),
+  ], { beforeAsk: true, classifier: "RISKY", childAgent: "tight" });
+  for (const i of [0, 2, 4]) assert.equal(results[i].threw, null, `step ${i} does not throw`);
+  assert.deepEqual(results[0].ask, askFor("cat mcp-auth.json", "bg_run"));
+  assert.deepEqual(results[4].ask, askFor("curl -X POST https://example.invalid", "pty_spawn"));
+  assertParent(results[1], /deferred bash floor$/, "credential floor -> parent");
+  assertParent(results[3], /native deny: bash|deferred bash floor$/, "named deny -> parent");
+  assertParent(results[5], /deferred bash floor$/, "classifier RISKY -> parent");
+  assert.deepEqual(replies, []);
+});
+
+test("beforeAsk host: a clean god-descendant bg_run still asks, so its hook validates the call", () => {
+  const { results } = escalationPlugin([
+    { before: { session: "ses_child", tool: "bg_run", callID: "c1", args: { command: "go test ./..." } } },
+  ], { beforeAsk: true });
+  assert.equal(results[0].threw, null);
+  assert.deepEqual(results[0].ask, askFor("go test ./...", "bg_run"));
+});
+
+test("beforeAsk host: an auto descendant's bg_run named ROOT deny goes to the human once", () => {
+  const { results } = escalationPlugin([
+    { before: { session: "ses_child", tool: "bg_run", callID: "c1", args: { command: "git push --force origin x" } } },
+    bashAsk("ses_child", "c1", "git push --force origin x", "deny"),
+  ], { rootMode: "auto", beforeAsk: true });
+  assert.equal(results[0].threw, null);
+  assert.deepEqual(results[0].ask, askFor("git push --force origin x", "bg_run"));
+  assert.equal(results[1].approval.kind, "human-only");
+});
+
+test("beforeAsk host: a failed bg_run frees its slot quietly", () => {
+  const { log } = escalationPlugin([
+    { before: { session: "ses_child", tool: "bg_run", callID: "c1", args: { command: "cat mcp-auth.json" } } },
+    { after: { session: "ses_child", tool: "bg_run", callID: "c1", failed: true } },
+  ], { beforeAsk: true });
+  assert.match(log, /escalation-abandoned/);
+  assert.doesNotMatch(log, /escalation-missed/);
+});
+
+test("without beforeAsk the process tools keep the legacy throw (older host)", () => {
+  const { results } = escalationPlugin([
+    { before: { session: "ses_child", tool: "bg_run", callID: "c1", args: { command: "cat mcp-auth.json" } } },
+  ]);
+  assert.match(results[0].threw, /names a credential store/);
+  assert.equal(results[0].ask, undefined);
 });
 
 test("a configured deny on a non-deferrable process tool stays blocked under auto, root or child", () => {
@@ -1586,5 +1645,5 @@ test("assertRequestBinding refuses an aborted root; an old host compares admissi
 
 test("rootContext output is unchanged by the binding API", async () => {
   const h = brokerHost();
-  assert.deepEqual(await h.broker.rootContext("ses_child"), { rootSessionID: "ses_root", rootMode: "god", isRoot: false });
+  assert.deepEqual(await h.broker.rootContext("ses_child"), { rootSessionID: "ses_root", rootMode: "god", isRoot: false, beforeAsk: false });
 });

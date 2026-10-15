@@ -826,3 +826,19 @@ test("a session missing from the status map is idle; busy is not; an unreadable 
   assert.equal(P.sessionIdle([], "ses_a"), false);
   assert.equal(P.sessionIdle({}, undefined), false, "no session id, nothing to delete");
 });
+
+test("redactLogLine masks secrets carried as command-line arguments, and keeps the command", () => {
+  const cases = [
+    [`curl -H "Authorization: Bearer sk-abc123def456" https://x`, `curl -H "Authorization: Bearer [redacted by opencode-guard]" https://x`],
+    [`git clone https://flan:hunter2pw@git.example/repo.git`, `git clone https://flan:[redacted by opencode-guard]@git.example/repo.git`],
+    [`curl -u admin:s3cretpw https://x`, `curl -u admin:[redacted by opencode-guard] https://x`],
+    [`tool --password hunter22 --verbose`, `tool --password [redacted by opencode-guard] --verbose`],
+    [`tool --api-key=abcdef123456 run`, `tool --api-key=[redacted by opencode-guard] run`],
+    [`tool --token "abc def" next`, `tool --token [redacted by opencode-guard] next`],
+    [`export B2_APPLICATION_KEY=K004abc`, `export B2_APPLICATION_KEY=[redacted by opencode-guard]`],
+  ];
+  for (const [input, expected] of cases) assert.equal(P.redactLogLine(input), expected, input);
+  for (const kept of [`ls -la /tmp && git status`, `grep -r token src`, `sed -i s/a/b/ notes.txt`]) {
+    assert.equal(P.redactLogLine(kept), kept, kept);
+  }
+});

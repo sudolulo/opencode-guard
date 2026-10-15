@@ -299,7 +299,7 @@ Suites, bun 1.4.2 package-local and node for the guard: native `packages/opencod
 - A23: guard "A23 unattended: ...", "A23 level off: ...".
 - A24: guard authority "a god root approves its child's current parent approval once", "a god root rejects its child's current parent approval; native receives reply reject" (added), and the cross-root, stale and mode-change tests.
 
-Closed 2026-10-15: `bg_run` / `pty_spawn` refusals are routed through a native ask requested by the before-hook (capability `beforeAsk: 1`). `opencode-pty`'s own config check inside the tool still refuses config "ask" commands itself. Known gaps, recorded: legacy log lines still carry raw commands; no real host or TUI proof until a build is authorized.
+Closed 2026-10-15: `bg_run` / `pty_spawn` refusals are routed through a native ask requested by the before-hook (capability `beforeAsk: 1`). `opencode-pty`'s own config check inside the tool still refuses config "ask" commands itself. Also closed 2026-10-15: a hook may lift an ask to a one-call allow only for the root's own request; a network-origin reply can only reject a `parent` ask; guard decision-log lines mask command-line secrets; the god root's own calls carry a context, so a god->auto flip mid-call denies. `opencode-pty` is not installed in this fleet (rejected; see devbox CHANGELOG), so its internal config check does not apply. Recorded residuals: unscoped LLM requests share the legacy websocket key until idle prune (not destructive); the admission-window race has no deterministic test hook (covered by review); operator asks, like any ordinary prompt, remain answerable by any client of an unsecured listener; no real host/TUI proof before the switch.
 
 ## 9. Sequencing, open decisions, uncertainties
 

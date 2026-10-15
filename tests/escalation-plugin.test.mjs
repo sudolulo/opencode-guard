@@ -903,6 +903,30 @@ test("review fix (ruling 7): a descendant's plain ask is judged by the ROOT's mo
   assert.deepEqual(god.replies, [{ id: "per_plain", response: "once" }], "the root's god mode decides, not the child's manual file");
 });
 
+test("decision log lines never carry a secret from the command line", () => {
+  const { log } = escalationPlugin([
+    bashBefore("ses_root", "c1", `curl -H "Authorization: Bearer sk-SECRETTOKEN123" https://example.invalid`),
+    bashBefore("ses_child", "c2", `curl -u admin:SECRETPASS99 https://example.invalid`),
+  ], { classifier: "RISKY", childAgent: "tight" });
+  assert.match(log, /curl/, "the command itself is still logged");
+  assert.doesNotMatch(log, /SECRETTOKEN123|SECRETPASS99/);
+});
+
+test("review fix: a god root that leaves god between its call and the call's hook gets a deny, not native's allow", () => {
+  const flipped = escalationPlugin([
+    bashBefore("ses_root", "c1", "sed -i s/a/b/ notes.txt"),
+    { mode: { session: "ses_root", mode: "auto" } },
+    bashAsk("ses_root", "c1", "sed -i s/a/b/ notes.txt", "allow"),
+  ]);
+  assert.equal(flipped.results[0].threw, null, "god skipped the floors");
+  assert.deepEqual(flipped.results[2], { status: "deny" });
+  const stayed = escalationPlugin([
+    bashBefore("ses_root", "c1", "sed -i s/a/b/ notes.txt"),
+    bashAsk("ses_root", "c1", "sed -i s/a/b/ notes.txt", "allow"),
+  ]);
+  assert.notEqual(stayed.results[1].status, "deny", "still god: the root's own call runs");
+});
+
 test("A21 escalation-missed is reported even with the guard level switched off afterwards", () => {
   const { log } = escalationPlugin([
     bashBefore("ses_child", "c1", "sed -i s/a/b/ notes.txt"),

@@ -18,7 +18,8 @@ were released privately as opencode-guardrails.
 ### Fixed
 
 - A deferred floor's slot is freed when its call fails before reaching the permission hook (native now marks `tool.execute.after` as `failed`), instead of being held until restart.
-- A call whose root left or entered god mode after it began is denied, not given the earlier mode's verdict.
+- A call whose root left or entered god mode after it began is denied, not given the earlier mode's verdict. This now includes the god root's own calls, whose floors were skipped.
+- Secrets in command lines (`Bearer` tokens, `user:password@` URLs, `-u user:pass`, `--password`/`--token`-style flags, `KEY=value`) are masked in the decision log; the command itself is still logged.
 - Every call binds its root incarnation before any asynchronous floor work. A replaced or aborted root never inherits a call's escalation, and a binding failure refuses the call.
 
 ## [1.8.1] — 2026-10-13

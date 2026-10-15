@@ -70,7 +70,7 @@ import { tool } from "/home/dev/.config/opencode/node_modules/@opencode-ai/plugi
 // resolves against this file's REAL path -- so a bare-file symlink into
 // ~/.config/opencode/plugin/ resolves back into this checkout.
 import {
-  normalizeLevel, normalizeMode, normalizeGlobalMode, resolveTreeMode, shouldAutoApprove, isUnattended, redactSecrets, revealActive,
+  normalizeLevel, normalizeMode, normalizeGlobalMode, resolveTreeMode, shouldAutoApprove, isUnattended, redactSecrets, redactLogLine, revealActive,
   commandUnder, credentialAdvice, siteConfig,
   strip, commandIsRead, launderReason, bashRulesLoad, parserError, bashRulesFromRuleset, configDenyReason, bashDenyKind, blanketAlwaysPattern, touchesCredentials, touchesHardCredentials, touchesPromptableCredentials,
   nativeCredentialGuardBlocks, localNoThinkApplies, directFallbackWarranted, SYSTEM, classifierDecides,
@@ -167,7 +167,8 @@ const log = (verdict, cmd) => {
     if (statSync(LOG, { throwIfNoEntry: false })?.size > LOG_MAX_BYTES) {
       writeFileSync(LOG, `${new Date().toISOString()} --- truncated ---\n`);
     }
-    appendFileSync(LOG, `${new Date().toISOString()} ${verdict} ${String(cmd).slice(0, 300)}\n`);
+    // Secrets in a command line are masked before the cut, so truncation cannot expose half of one.
+    appendFileSync(LOG, `${new Date().toISOString()} ${verdict} ${redactLogLine(cmd).slice(0, 300)}\n`);
   } catch {}
 };
 
@@ -1401,7 +1402,13 @@ const modeFor = async (sessionID) => {
         if (binding) keepContext(contextKey, { sessionID: input.sessionID, tool: input?.tool, root: ctx.rootSessionID, mode: ctx.rootMode, binding });
       };
       if (ctx) {
-        if (ctx.isRoot && ctx.rootMode === "god") { log("allow(god)", command ?? input?.tool); return; }
+        if (ctx.isRoot && ctx.rootMode === "god") {
+          // The floors were skipped under god: keep the call's mode so its permission hook denies
+          // it if the root left god in between, instead of letting native's allow stand.
+          if (contextKey) keepContext(contextKey, { sessionID: input.sessionID, tool: input?.tool, root: ctx.rootSessionID, mode: ctx.rootMode });
+          log("allow(god)", command ?? input?.tool);
+          return;
+        }
         // A process tool becomes deferrable only when native will ask for it (beforeAsk) and the
         // guard has its command line to ask about.
         const viaAsk = !DEFERRABLE[input?.tool] && ctx.beforeAsk === true && Boolean(command) && ASKABLE[input?.tool];

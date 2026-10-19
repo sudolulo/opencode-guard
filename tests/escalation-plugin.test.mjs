@@ -152,9 +152,10 @@ const escalationPlugin = (steps, {
         if (path === "/api/session/ses_root") {
           await fire("rootGet");
           if (rootGetFails) return json({ name: "Unavailable" }, 503);
-          return json({ id: "ses_root", ...(incarnations ? { incarnationID: rootIncarnation } : {}) });
+          // The real host wraps /api/session/{id} in an envelope: { data: Session }.
+          return json({ data: { id: "ses_root", ...(incarnations ? { incarnationID: rootIncarnation } : {}) } });
         }
-        if (path === "/api/session/ses_child") return json({ id: "ses_child", parentID: "ses_root", agent: "seat" });
+        if (path === "/api/session/ses_child") return json({ data: { id: "ses_child", parentID: "ses_root", agent: "seat" } });
         if (path === "/session/ses_root/message") return json([{ info: { role: "user", agent: "build", model: { providerID: "openai", modelID: "gpt" } } }]);
         return json({});
       };

@@ -240,7 +240,7 @@ test("native approval annotations bypass legacy replies and classifier work in t
         const path = new URL(request.url).pathname;
         if (path.endsWith("/experimental/capabilities")) return new Response(JSON.stringify({ permissionAuthority: 2, backgroundSubagents: true }), { headers: { "content-type": "application/json" } });
         if (path.endsWith("/permission")) return new Response(JSON.stringify(pending), { headers: { "content-type": "application/json" } });
-        if (path === "/api/session/ses_root") return new Response(JSON.stringify({ id: "ses_root" }), { headers: { "content-type": "application/json" } });
+        if (path === "/api/session/ses_root") return new Response(JSON.stringify({ data: { id: "ses_root" } }), { headers: { "content-type": "application/json" } });
         if (path === "/session/ses_child") return new Response(JSON.stringify({ id: "ses_child", parentID: "ses_root" }), { headers: { "content-type": "application/json" } });
         if (path === "/session/ses_root/message") return new Response(JSON.stringify([{ info: { role: "user", agent: "smart", model: { providerID: "openai", modelID: "gpt", variant: "fast" } } }]), { headers: { "content-type": "application/json" } });
         return new Response(JSON.stringify({ data: {} }), { headers: { "content-type": "application/json" } });
@@ -306,7 +306,7 @@ test("plugin lifecycle events fence late approval wakeups until a real root user
         const path = new URL(request.url).pathname;
         if (path.endsWith("/experimental/capabilities")) return new Response(JSON.stringify({ permissionAuthority: 2, backgroundSubagents: true }), { headers: { "content-type": "application/json" } });
         if (path.endsWith("/permission")) return new Response(JSON.stringify(pending), { headers: { "content-type": "application/json" } });
-        if (path === "/api/session/ses_root") return new Response(JSON.stringify({ id: "ses_root" }), { headers: { "content-type": "application/json" } });
+        if (path === "/api/session/ses_root") return new Response(JSON.stringify({ data: { id: "ses_root" } }), { headers: { "content-type": "application/json" } });
         if (path === "/session/ses_root/message") return new Response(JSON.stringify([{ info: { role: "user", agent: "smart", model: { providerID: "openai", modelID: "gpt" } } }]), { headers: { "content-type": "application/json" } });
         return new Response(JSON.stringify({ data: {} }), { headers: { "content-type": "application/json" } });
       };
@@ -359,7 +359,7 @@ const incarnationPlugin = (events) => {
         const path = new URL(request.url).pathname;
         if (path.endsWith("/experimental/capabilities")) return new Response(JSON.stringify({ permissionAuthority: 2, backgroundSubagents: true, sessionIncarnation: 1 }), { headers: { "content-type": "application/json" } });
         if (path.endsWith("/permission")) return new Response(JSON.stringify(pending), { headers: { "content-type": "application/json" } });
-        if (path === "/api/session/ses_root") return new Response(JSON.stringify({ id: "ses_root", incarnationID: "inc_2" }), { headers: { "content-type": "application/json" } });
+        if (path === "/api/session/ses_root") return new Response(JSON.stringify({ data: { id: "ses_root", incarnationID: "inc_2" } }), { headers: { "content-type": "application/json" } });
         if (path === "/session/ses_root/message") return new Response(JSON.stringify([{ info: { role: "user", agent: "smart", model: { providerID: "openai", modelID: "gpt" } } }]), { headers: { "content-type": "application/json" } });
         return new Response(JSON.stringify({ data: {} }), { headers: { "content-type": "application/json" } });
       };
@@ -447,7 +447,7 @@ const incarnationPluginSteps = (steps) => {
         }
         if (path.endsWith("/experimental/capabilities")) return json({ permissionAuthority: 2, backgroundSubagents: true, sessionIncarnation: 1 });
         if (path.endsWith("/permission")) return json(pending);
-        if (path === "/api/session/ses_root") return json({ id: "ses_root", incarnationID: rootIncarnation });
+        if (path === "/api/session/ses_root") return json({ data: { id: "ses_root", incarnationID: rootIncarnation } });
         if (path === "/session/ses_root/message") return json([{ info: { role: "user", agent: "smart", model: { providerID: "openai", modelID: "gpt" } } }]);
         return json({ data: {} });
       };
@@ -558,7 +558,8 @@ const pluginRace = (scenario, mode = "god") => {
         if (path === "/experimental/capabilities") return json({ permissionAuthority: 2, backgroundSubagents: true });
         if (path === "/permission") return json(pending);
         if (path === "/session/ses_root/message") return json([{ info: { role: "user", agent: "smart", model: { providerID: "openai", modelID: "gpt", variant: "fast" } } }]);
-        if (path === "/api/session/ses_child" || path === "/session/ses_child") return json({ id: "ses_child", parentID: "ses_root" });
+        if (path === "/api/session/ses_child") return json({ data: { id: "ses_child", parentID: "ses_root" } });
+        if (path === "/session/ses_child") return json({ id: "ses_child", parentID: "ses_root" });
         return json({ id: "ses_root" });
       };
       const client = { session: {
@@ -607,7 +608,7 @@ const INCARNATION_HOST_FETCH = `
   let incarnation = "inc_1";
   const incarnationHost = async (path) => {
     if (path === "/experimental/capabilities") return json({ permissionAuthority: 2, backgroundSubagents: true, sessionIncarnation: 1 });
-    if (path === "/api/session/ses_root") return json({ id: "ses_root", incarnationID: incarnation });
+    if (path === "/api/session/ses_root") return json({ data: { id: "ses_root", incarnationID: incarnation } });
   };
 `;
 
@@ -644,7 +645,7 @@ test("old host: actual plugin still wakes a root whose GET changes underneath, a
   pluginRace(`
     let incarnation = "inc_1";
     onFetch = async (path) => {
-      if (path === "/api/session/ses_root") return json({ id: "ses_root", incarnationID: incarnation });
+      if (path === "/api/session/ses_root") return json({ data: { id: "ses_root", incarnationID: incarnation } });
       if (path.endsWith("/background")) { incarnation = "inc_2"; return json(true); }
     };
     await ask();
@@ -1276,4 +1277,13 @@ test("guard_decide cannot grant a queued immutable escalation intent when root r
   await assert.rejects(f.broker.decide({ sessionID: "ses_root", permissionID: "per_child", decision: "once" }), /human escalation intent/);
   assert.equal(f.replies.length, 2);
   assert.ok(f.replies.every(({ reply }) => reply === "escalate"));
+});
+
+test("sessionOf reads a session through the real host's envelope and through a bare body alike", async () => {
+  const { sessionOf } = await import("../lib/authority.js");
+  const session = { id: "ses_child", parentID: "ses_root" };
+  assert.deepEqual(sessionOf({ data: { data: session } }), session, "SDK result of GET /api/session/{id}");
+  assert.deepEqual(sessionOf({ data: session }), session, "bare body (older host, injected client)");
+  assert.deepEqual(sessionOf(session), session);
+  assert.equal(sessionOf(null), null);
 });

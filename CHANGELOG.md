@@ -7,6 +7,12 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.9.1] — 2026-10-19
+
+### Fixed
+
+- Session reads through the v2 API (`GET /api/session/{id}`) unwrap the host's `{ data: Session }` envelope. Before this, every such read on a real host looked like a session with no id and no parent: a tracked root's next user message was refused (`approval-resume-error ... returned an invalid response`), parent approvals could not be read or decided, and descendants were treated as roots. The test hosts now answer with the real envelope.
+
 ## [1.9.0] — 2026-10-15
 
 ### Changed

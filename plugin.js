@@ -85,7 +85,7 @@ import { readSessionIdentity } from "./lib/session-identity.js";
 import { loadSafetyNet, safetyNetVerdict } from "./lib/safety-net.js";
 import { createSessionTree, createTeamIndex, treeLookupDenial, treeRuleRefusal } from "./lib/tree.js";
 import { AGENT_SHELL_ENV, AGENT_SPAWN_REFUSAL, agentSpawnRefusal } from "./lib/agent-spawn.js";
-import { AUTHORITY_UNSUPPORTED, createAuthorityBroker } from "./lib/authority.js";
+import { AUTHORITY_UNSUPPORTED, createAuthorityBroker, sessionOf } from "./lib/authority.js";
 import { createRootLifecycle } from "./lib/lifecycle.js";
 import { decideProposal } from "./lib/escalation.js";
 
@@ -445,7 +445,7 @@ const infoFor = async (sessionID) => {
   if (sessionInfo.has(sessionID)) return sessionInfo.get(sessionID);
   try {
     const payload = await v2Client().v2.session.get({ sessionID });
-    const info = payload?.data ?? payload;
+    const info = sessionOf(payload);
     if (sessionInfo.size > 500) sessionInfo.clear();
     const record = { parentID: info?.parentID, agent: info?.agent };
     sessionInfo.set(sessionID, record);

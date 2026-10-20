@@ -222,7 +222,7 @@ test("the notifier queues a failed send and drops the queue with the session", a
   assert.equal(notifier.pendingCount(), 0);
 });
 
-test("approval notification preserves root identity and waits for idle", async () => {
+test("approval notification preserves root identity and wakes a busy root at once", async () => {
   const sent = [];
   const sdk = { session: { promptAsync: async (request) => { sent.push(request); } } };
   const notifier = createApprovalNotifier({
@@ -230,10 +230,10 @@ test("approval notification preserves root identity and waits for idle", async (
     identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt", variant: "fast" } }),
     current: async () => true,
   });
+  // A child is blocked on this wake; the busy root is the one that must see it mid-turn.
   await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
-  assert.equal(await notifier.notify("ses_root", "per_1"), false);
-  assert.deepEqual(sent, []);
-  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
+  assert.equal(await notifier.notify("ses_root", "per_1"), true);
+  assert.equal(notifier.pendingCount(), 0);
   assert.deepEqual(sent, [{
     sessionID: "ses_root", directory: "/work", agent: "smart",
     model: { providerID: "openai", modelID: "gpt", variant: "fast" },
@@ -249,7 +249,6 @@ test("approval notification drops stale and aborted requests without waking a ro
     current: async () => false,
   });
   assert.equal(await notifier.notify("ses_root", "per_stale"), false);
-  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
   await notifier.notify("ses_root", "per_abort");
   await notifier.onEvent({ type: "session.aborted", properties: { sessionID: "ses_root" } });
   await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
@@ -309,28 +308,21 @@ test("approval notification fences an identity lookup aborted before promptAsync
   assert.equal(notifier.pendingCount(), 0, "a cancelled root is never re-enqueued");
 });
 
-test("approval notification requeues if root becomes busy during identity lookup and rereads identity on idle", async () => {
+test("approval notification still wakes a root that turns busy during identity lookup", async () => {
   let resolveIdentity;
-  let identityReads = 0;
   const sent = [];
   const notifier = createApprovalNotifier({
     sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work",
-    identityFor: () => {
-      identityReads += 1;
-      return identityReads === 1
-        ? new Promise((resolve) => { resolveIdentity = resolve; })
-        : Promise.resolve({ agent: "fresh", model: { providerID: "openai", modelID: "new" } });
-    },
+    identityFor: () => new Promise((resolve) => { resolveIdentity = resolve; }),
     current: async () => true,
   });
   const waking = notifier.notify("ses_root", "per_busy");
   await Promise.resolve();
   await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
-  resolveIdentity({ agent: "stale", model: { providerID: "openai", modelID: "old" } });
-  assert.equal(await waking, false);
-  await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
-  assert.equal(identityReads, 2);
-  assert.equal(sent[0].agent, "fresh");
+  resolveIdentity({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } });
+  assert.equal(await waking, true);
+  assert.equal(sent.length, 1);
+  assert.equal(notifier.pendingCount(), 0);
 });
 
 test("approval notification rechecks fresh pending after identity and drops a root deleted during lookup", async () => {
@@ -355,13 +347,17 @@ test("approval notification rechecks fresh pending after identity and drops a ro
 
 test("approval notification never evicts the only still-pending cause under queue pressure", async () => {
   const sent = [];
+  let offline = true;
+  let settled = false;
   const notifier = createApprovalNotifier({
-    sdk: { session: { promptAsync: async (request) => sent.push(request) } },
+    sdk: { session: { promptAsync: async (request) => { if (offline) throw new Error("offline"); sent.push(request); } } },
     identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
-    current: async (_root, id) => id === "per_0",
+    current: async (_root, id) => !settled || id === "per_0",
   });
-  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
   for (let i = 0; i < 101; i += 1) await notifier.notify("ses_root", `per_${i}`);
+  assert.equal(notifier.pendingCount(), 101, "every failed send is queued");
+  settled = true;
+  offline = false;
   await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
   assert.equal(sent.length, 1, "the remaining authoritative pending request must still wake the root");
   assert.equal(notifier.pendingCount(), 0);
@@ -370,11 +366,13 @@ test("approval notification never evicts the only still-pending cause under queu
 test("an old failed send and an old idle-drain batch cannot acquire a resumed root's new token", async () => {
   const lifecycle = createRootLifecycle();
   let rejectSend, reached;
+  let offline = true;
   const waiting = new Promise((resolve) => { reached = resolve; });
   const sent = [];
   const notifier = createApprovalNotifier({
     lifecycle,
     sdk: { session: { promptAsync: (request) => {
+      if (offline) return Promise.reject(new Error("offline"));
       sent.push(request);
       if (sent.length > 1) return Promise.resolve();
       return new Promise((_resolve, reject) => { rejectSend = reject; reached(); });
@@ -382,9 +380,9 @@ test("an old failed send and an old idle-drain batch cannot acquire a resumed ro
     identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
     current: async () => true,
   });
-  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
   await notifier.notify("ses_root", "per_1");
   await notifier.notify("ses_root", "per_2");
+  offline = false;
   const draining = notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
   await waiting;
   await notifier.onEvent({ type: "session.aborted", properties: { sessionID: "ses_root" } });
@@ -396,13 +394,14 @@ test("an old failed send and an old idle-drain batch cannot acquire a resumed ro
 });
 
 test("approval queue removes exact replied IDs and drains all remaining stale IDs", async () => {
+  let live = true;
   const notifier = createApprovalNotifier({
-    sdk: { session: { promptAsync: async () => assert.fail("stale IDs must not send") } },
-    current: async () => false,
-    identityFor: async () => assert.fail("stale IDs must not read identity"),
+    sdk: { session: { promptAsync: async () => { if (live) throw new Error("offline"); assert.fail("stale IDs must not send"); } } },
+    current: async () => live,
+    identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
   });
-  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
   for (const id of ["per_1", "per_1", "per_2", "per_3"]) await notifier.notify("ses_root", id);
+  live = false;
   assert.equal(notifier.pendingCount(), 3, "exact request IDs are deduplicated");
   await notifier.onEvent({ type: "permission.replied", properties: { sessionID: "ses_child", requestID: "per_2" } });
   assert.equal(notifier.pendingCount(), 2);

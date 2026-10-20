@@ -7,6 +7,12 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.10.2] — 2026-10-20
+
+### Fixed
+
+- **A child's permission ask reaches a busy root instead of waiting out its turn.** The approval wake ("A child permission request ... is pending") was held while the root was busy and sent only at its next idle. A root working through one long turn therefore never heard about the ask, and the child sat blocked on it: on 2026-10-20 a researcher's `read` and a tester's `bash` in the anthro pane waited 10+ minutes behind a single root turn that began a minute before the first of them. The wake is now sent straight into the running turn, the way the host already delivers a background task's result (the fork folds a mid-turn prompt into the loop after the replies that did not see it). Only a wake whose send fails is queued, for the root's next idle; the incarnation, admission and abort/delete fences are unchanged. `lib/notify.js`.
+
 ## [1.10.1] — 2026-10-20
 
 ### Changed

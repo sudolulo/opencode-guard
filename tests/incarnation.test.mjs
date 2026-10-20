@@ -612,20 +612,22 @@ test("old host: observe still promotes and returns the root binding", async (t) 
 test("an approval wake passes its bound incarnation to every authoritative check, including idle drain", async () => {
   const checks = [];
   const sent = [];
+  let offline = true;
   const lifecycle = createRootLifecycle();
   const notifier = createApprovalNotifier({
-    sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work", lifecycle,
+    sdk: { session: { promptAsync: async (request) => { if (offline) throw new Error("offline"); sent.push(request); } } }, directory: "/work", lifecycle,
     identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
     current: async (sessionID, requestID, incarnationID) => { checks.push([sessionID, requestID, incarnationID]); return incarnationID === "inc_1"; },
   });
-  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
-  assert.equal(await notifier.notify("ses_root", "per_1", undefined, "inc_1"), false);
+  assert.equal(await notifier.notify("ses_root", "per_1", undefined, "inc_1"), false, "a failed send is queued");
   assert.equal(await notifier.notify("ses_root", "per_2", undefined, "inc_0"), false);
+  offline = false;
   await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
   assert.equal(sent.length, 1, "only the wake whose incarnation still matches is sent");
   assert.deepEqual(checks, [
     ["ses_root", "per_1", "inc_1"], ["ses_root", "per_1", "inc_1"],
     ["ses_root", "per_2", "inc_0"],
+    ["ses_root", "per_1", "inc_1"], ["ses_root", "per_1", "inc_1"],
   ]);
   assert.equal(notifier.pendingCount(), 0);
 });
@@ -653,19 +655,20 @@ test("a delayed inc1 abort or delete neither closes nor discards the inc2 root's
   const lifecycle = createRootLifecycle();
   lifecycle.enableIncarnations();
   const sent = [];
+  let offline = true;
   const notifier = createApprovalNotifier({
-    sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work", lifecycle,
+    sdk: { session: { promptAsync: async (request) => { if (offline) throw new Error("offline"); sent.push(request); } } }, directory: "/work", lifecycle,
     identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
     current: async () => true,
   });
   const token = lifecycle.track("ses_root");
   lifecycle.bind("ses_root", token, "inc_2");
-  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
   assert.equal(await notifier.notify("ses_root", "per_1", token, "inc_2"), false);
   await notifier.onEvent(aborted("ses_root", "inc_1"));
   await notifier.onEvent(deleted("ses_root", "inc_1"));
   assert.equal(notifier.pendingCount(), 1, "the inc2 wake survives stale events");
   assert.equal(lifecycle.admit("ses_root", token), true);
+  offline = false;
   await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
   assert.equal(sent.length, 1);
 });
@@ -673,51 +676,54 @@ test("a delayed inc1 abort or delete neither closes nor discards the inc2 root's
 test("old host: abort and delete still discard a queued wake by ID", async () => {
   const lifecycle = createRootLifecycle();
   const sent = [];
+  let offline = true;
   const notifier = createApprovalNotifier({
-    sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work", lifecycle,
+    sdk: { session: { promptAsync: async (request) => { if (offline) throw new Error("offline"); sent.push(request); } } }, directory: "/work", lifecycle,
     identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
     current: async () => true,
   });
-  await notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
   await notifier.notify("ses_root", "per_1", undefined, undefined);
+  assert.equal(notifier.pendingCount(), 1);
   await notifier.onEvent(aborted("ses_root", "inc_other"));
   assert.equal(notifier.pendingCount(), 0);
+  offline = false;
   await notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
   assert.deepEqual(sent, []);
 });
 
 // Approval notifier: an identity-bearing abort/delete drops only what provably
-// belongs to the event's incarnation. Busy state is per session ID and is cleared
-// only when the event matches the record's bound incarnation.
+// belongs to the event's incarnation. A wake is queued only when its send fails,
+// so `down()` makes sends fail and `up()` restores them.
 const wakeNotifier = (lifecycle) => {
   const sent = [];
+  let offline = false;
   const notifier = createApprovalNotifier({
-    sdk: { session: { promptAsync: async (request) => sent.push(request) } }, directory: "/work", lifecycle,
+    sdk: { session: { promptAsync: async (request) => { if (offline) throw new Error("offline"); sent.push(request); } } }, directory: "/work", lifecycle,
     identityFor: async () => ({ agent: "smart", model: { providerID: "openai", modelID: "gpt" } }),
     current: async () => true,
   });
-  const busy = () => notifier.onEvent({ type: "session.status", properties: { sessionID: "ses_root", status: { type: "busy" } } });
+  const down = () => { offline = true; };
+  const up = () => { offline = false; };
   const idle = () => notifier.onEvent({ type: "session.idle", properties: { sessionID: "ses_root" } });
   const sentIDs = () => sent.map((request) => /\((per_[a-z]+)\)/.exec(request.parts[0].text)[1]);
-  return { notifier, sent, sentIDs, busy, idle };
+  return { notifier, sent, sentIDs, down, up, idle };
 };
 
 for (const [name, event] of [["aborted", aborted], ["deleted", deleted]]) {
-  test(`an identity session.${name} drops only the queued wakes bound to that incarnation and keeps busy`, async () => {
+  test(`an identity session.${name} drops only the queued wakes bound to that incarnation`, async () => {
     const lifecycle = createRootLifecycle();
     lifecycle.enableIncarnations();
     const w = wakeNotifier(lifecycle);
     const token = lifecycle.track("ses_root");
-    await w.busy();
+    w.down();
     assert.equal(await w.notifier.notify("ses_root", "per_old", token, "inc_1"), false);
     assert.equal(await w.notifier.notify("ses_root", "per_new", token, "inc_2"), false);
     await w.notifier.onEvent(event("ses_root", "inc_1"));
     assert.equal(w.notifier.pendingCount(), 1, "only the inc_1 wake is dropped");
-    // The busy flag cannot be attributed to inc_1, so a new inc_2 wake still waits.
-    assert.equal(await w.notifier.notify("ses_root", "per_newer", token, "inc_2"), false);
-    assert.deepEqual(w.sent, [], "nothing is sent into a possibly busy replacement");
+    w.up();
+    assert.equal(await w.notifier.notify("ses_root", "per_newer", token, "inc_2"), true, "the replacement is woken at once");
     await w.idle();
-    assert.deepEqual(w.sentIDs(), ["per_new", "per_newer"]);
+    assert.deepEqual(w.sentIDs(), ["per_newer", "per_new"]);
   });
 }
 
@@ -728,39 +734,40 @@ for (const [name, event] of [["aborted", aborted], ["deleted", deleted]]) {
     const w = wakeNotifier(lifecycle);
     // Unbound record: the inc_1 event cannot be compared yet, so it is deferred.
     const token = lifecycle.track("ses_root");
-    await w.busy();
-    assert.equal(await w.notifier.notify("ses_root", "per_new", token, "inc_2"), false, "queued behind busy");
+    w.down();
+    assert.equal(await w.notifier.notify("ses_root", "per_new", token, "inc_2"), false, "queued after a failed send");
     await w.notifier.onEvent(event("ses_root", "inc_1"));
     assert.equal(w.notifier.pendingCount(), 1, "the inc_2 wake is not discarded");
-    // Busy is kept by design (it cannot be attributed to inc_1), so nothing is sent yet.
     assert.deepEqual(w.sent, []);
+    w.up();
     await w.idle();
     assert.deepEqual(w.sentIDs(), ["per_new"], "idle re-delivers it");
     assert.equal(w.notifier.pendingCount(), 0);
   });
 }
 
-test("a matching identity abort on the bound record drops its wakes and clears busy", async () => {
+test("a matching identity abort on the bound record drops its wakes", async () => {
   const lifecycle = createRootLifecycle();
   lifecycle.enableIncarnations();
   const w = wakeNotifier(lifecycle);
   const token = lifecycle.track("ses_root");
   lifecycle.bind("ses_root", token, "inc_1");
-  await w.busy();
+  w.down();
   await w.notifier.notify("ses_root", "per_old", token, "inc_1");
   await w.notifier.onEvent(aborted("ses_root", "inc_1"));
   assert.equal(w.notifier.pendingCount(), 0);
   lifecycle.resume("ses_root", [{ type: "text", text: "continue" }]);
-  assert.equal(await w.notifier.notify("ses_root", "per_next", undefined, "inc_1"), true, "busy was cleared by the matching abort");
+  w.up();
+  assert.equal(await w.notifier.notify("ses_root", "per_next", undefined, "inc_1"), true, "the resumed root is woken");
 });
 
-test("an ID-only abort on an incarnation host still drops every queued wake and busy", async () => {
+test("an ID-only abort on an incarnation host still drops every queued wake", async () => {
   const lifecycle = createRootLifecycle();
   lifecycle.enableIncarnations();
   const w = wakeNotifier(lifecycle);
   const token = lifecycle.track("ses_root");
   lifecycle.bind("ses_root", token, "inc_2");
-  await w.busy();
+  w.down();
   await w.notifier.notify("ses_root", "per_new", token, "inc_2");
   await w.notifier.onEvent(aborted("ses_root"));
   assert.equal(w.notifier.pendingCount(), 0);

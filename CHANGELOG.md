@@ -7,6 +7,14 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.10.3] — 2026-10-20
+
+### Fixed
+
+- Quoted, isolated Python stdin can use an `at = ...` data field without being mistaken for an `at` scheduler launch. The assignment-specific exemption requires both `-I` and `-S` on the actual invocation and a successful, bounded AST-only check of the complete source. Unsupported operations, unknown bindings and an unavailable checker fail closed; existing raw launcher and local server API checks remain active.
+- Heredoc ownership follows Bash's exact delimiter-line rules, including tab stripping for `<<-`. Parser/raw-boundary disagreement, trailing delimiter text and ambiguous carriage returns cannot hide source from validation.
+- Python source validation is lazy and limited to the heredoc owning the ambiguous assignment, with per-command caching. Unrelated commands do not start the parser or checker. The supported subset, Python 3 requirement and resource limits are documented.
+
 ## [1.10.2] — 2026-10-20
 
 ### Fixed

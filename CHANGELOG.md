@@ -7,6 +7,12 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-10-20
+
+### Changed
+
+- **A god descendant's plain native ask no longer costs the root a model turn when auto would allow it.** The permission hook now answers such an ask with auto's own judgment: every non-bash permission auto approves (edits, reads, external directories), and bash only on a SAFE verdict -- the static read list, else the classifier at level `on` -- never a credential command. Anything that judgment refuses or cannot decide, every native deny, and every deferred floor or root-deny escalation still become exact `parent` asks as before; god stays strictly wider than auto. Measured over 3 days in 4 panes: 2,674 descendant asks cost the god roots 673 turns and 5.3 h of `guard_decide`, and children waited on the busy root for 44% of active wall time. Ruling recorded in `docs/superpowers/specs/2026-10-14-god-escalation-policy-design.md`.
+
 ## [1.9.1] — 2026-10-19
 
 ### Fixed

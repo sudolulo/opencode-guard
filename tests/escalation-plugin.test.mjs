@@ -410,9 +410,71 @@ test("A4 god descendant: native seat, role, ceiling, named and non-bash denies b
   assertParent(results[3], /^(net: deferred bash floor|native deny: bash)$/, "global named rule");
   assertParent(results[5], /native deny: edit/, "role deny on edit");
   assertParent(results[6], /native deny: external_directory/, "session ceiling");
-  assertParent(results[7], /native ask: read/, "native ask");
+  // A plain native ASK that an auto root's descendant would get unasked is allowed here (see
+  // "god descendant native asks"); every DENY above still reaches the root model.
+  assert.equal(results[7].status, "allow", "native ask: read, judged as auto");
+  assert.equal(results[7].approval, undefined);
   assert.deepEqual(results[8], { status: "allow" }, "an unflagged zero-pattern allow is left alone");
   assert.deepEqual(replies, []);
+});
+
+// 2026-10-20: 2,674 god-descendant asks in 3 days cost the god roots 673 turns and 5.3 h of
+// guard_decide, with children blocked on the root 44% of active wall time. A plain native ASK is
+// now answered with auto's own judgment; only what that judgment refuses or cannot decide, and
+// every deny and floor, still goes to the root model.
+// Steps with names, so config-only steps (which also yield a result) never shift an index.
+const named = (entries) => ({ steps: entries.map(([, step]) => step), at: Object.fromEntries(entries.map(([name], index) => [name, index])) });
+
+test("god descendant native asks: auto's own judgment answers, anything it would not allow still goes to the root model", () => {
+  const { steps, at } = named([
+    ["eBefore", { before: { session: "ses_child", tool: "edit", callID: "e1", args: { filePath: "__HOME__/work/notes.txt" } } }],
+    ["edit", { ask: { session: "ses_child", callID: "e1", permission: "edit", status: "ask", patterns: ["notes.txt"] } }],
+    ["external", { ask: { session: "ses_child", callID: "x1", permission: "external_directory", status: "ask", patterns: ["/srv/data/*"] } }],
+    ["unavailable1", { classifier: "UNAVAILABLE" }],
+    ["lsBefore", bashBefore("ses_child", "b1", "ls -la src")],
+    ["readList", bashAsk("ses_child", "b1", "ls -la src", "ask")],
+    ["safe", { classifier: "SAFE" }],
+    ["testBefore", bashBefore("ses_child", "b2", "go test ./...")],
+    ["classifierSafe", bashAsk("ses_child", "b2", "go test ./...", "ask")],
+    ["risky", { classifier: "RISKY" }],
+    ["deployBefore", bashBefore("ses_child", "b3", "make deploy-prod")],
+    ["classifierRisky", bashAsk("ses_child", "b3", "make deploy-prod", "ask")],
+    ["unavailable2", { classifier: "UNAVAILABLE" }],
+    ["buildBefore", bashBefore("ses_child", "b4", "npm run build")],
+    ["classifierDown", bashAsk("ses_child", "b4", "npm run build", "ask")],
+    ["question", { ask: { session: "ses_child", callID: "q1", permission: "question", status: "ask", patterns: ["*"] } }],
+  ]);
+  const { results, replies } = escalationPlugin(steps);
+  for (const name of ["edit", "external", "readList", "classifierSafe"]) {
+    assert.equal(results[at[name]].status, "allow", name);
+    assert.equal(results[at[name]].approval, undefined, `${name}: no escalation`);
+    assert.equal(results[at[name]].forceAsk, undefined, `${name}: not forced`);
+  }
+  // RISKY may already be stopped by the classifier floor in the before-hook; either way the root
+  // model decides, never this rule.
+  assertParent(results[at.classifierRisky], /^(native ask: bash|.*classifier.*|llm.*)$/i, "classifier RISKY");
+  assertParent(results[at.classifierDown], /^(native ask: bash|.*classifier.*|llm.*)$/i, "classifier unavailable");
+  assertParent(results[at.question], /native ask: question/, "a question is never auto-answered");
+  assert.deepEqual(replies, [], "decided in the permission hook, never by a legacy reply");
+});
+
+test("god descendant native asks: static level and floors still escalate; an auto root is unchanged", () => {
+  const { steps, at } = named([
+    ["static", { level: "static" }],
+    ["vetBefore", bashBefore("ses_child", "s1", "go vet ./...")],
+    ["staticAsk", bashAsk("ses_child", "s1", "go vet ./...", "ask")],
+    ["on", { level: "on" }],
+    ["sedBefore", bashBefore("ses_child", "s2", "sed -i s/a/b/ notes.txt")],
+    ["launder", bashAsk("ses_child", "s2", "sed -i s/a/b/ notes.txt", "ask")],
+  ]);
+  const god = escalationPlugin(steps);
+  assertParent(god.results[at.staticAsk], /native ask: bash/, "level static: no verdict for an unlisted command");
+  assertParent(god.results[at.launder], /^launder: /, "a deferred floor keeps its own escalation");
+  const auto = escalationPlugin([
+    bashBefore("ses_child", "a1", "go test ./..."),
+    bashAsk("ses_child", "a1", "go test ./...", "ask"),
+  ], { rootMode: "auto" });
+  assert.notEqual(auto.results[1].status, "allow", "the auto path is not touched by this rule");
 });
 
 test("A5/A8 god descendant: a zero-pattern request consumes its own stash and becomes a parent ask", () => {

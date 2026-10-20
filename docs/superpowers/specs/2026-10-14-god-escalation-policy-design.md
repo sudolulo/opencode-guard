@@ -29,6 +29,18 @@ These replace any earlier snippet or cell that contradicts them; sections 4, 5.2
 8. **Metadata and log separation.** Approval reasons and the policy's new log lines carry a class and generic description, never the command; native request metadata (command, workdir) is never altered, so the approver sees the exact action.
 9. **Binding-read cost (measured with the fixture, `tests/escalation-plugin.test.mjs` cost test).** One attended descendant bash call that meets no floor now costs 4 capability probes and 2 root reads across before-hook and permission hook (measured 3 and 1 before this round); a root's own call costs no binding read; a non-deferrable descendant tool call (webfetch) now costs 2 probes and 1 root read in its before-hook.
 
+## Ruling (Holden, 2026-10-20): native asks of a god descendant
+
+A god descendant's plain native **ask** (no deferred floor, no root-deny marker) that an auto
+root's descendant would get with nobody asked is allowed in the permission hook instead of going
+to the root model: every non-bash permission auto approves, and bash only on a SAFE verdict
+(static read list, else the classifier at level `on`), never a credential command. Whatever that
+judgment refuses or cannot decide, every native **deny**, and every floor or root-deny escalation
+still become exact parent asks exactly as below. God stays strictly wider than auto, so this
+grants nothing auto does not already grant. Reason (measured over 3 days, 4 panes): 2,674
+descendant asks cost the god roots 673 turns and 5.3 h of `guard_decide`, and children waited on
+the busy root for 44% of active wall time. Policy 2 below is narrowed accordingly.
+
 ## 1. Policy (binding, Holden 2026-10-14)
 
 1. **God root, own requests: allowed.** This includes requests for any visible tool permission, global named hard rules (`rm -rf /*`, `mkfs*`, `git push --force*`, ...) and guard floors (credential, `/tmp` launder, LLM classifier). Today native config deny refuses even the god root; that ends.
@@ -79,7 +91,7 @@ Columns: who issued the request, under which root mode. "Parent" = exact `approv
 | Guard launder floor | Allowed | Parent | Throw | Throw (judged with root AND child rules) |
 | cc-safety-net | Allowed | Parent | Throw | Throw |
 | LLM classifier RISKY / unavailable / no lane | Allowed | Parent | Throw | Throw |
-| Native ask (not a refusal) | Allowed (existing) | Parent (existing) | Classifier (fixed: no `operator` annotation) | Classifier (existing delegated judgment) |
+| Native ask (not a refusal) | Allowed (existing) | Auto's judgment allows it; else Parent (2026-10-20) | Classifier (fixed: no `operator` annotation) | Classifier (existing delegated judgment) |
 | Tool hidden from the seat (final `*` deny on the tool) | Unavailable | Unavailable | Unavailable | Unavailable |
 | Tree gates G1/G2/G4, stale turn, read-intent gate, launch guard | Throw | Throw | Throw | Throw |
 | Guard self-integrity: control-file write, reveal-arm | Allowed (existing god bypass) | Parent (once/reject) | Throw | Throw |

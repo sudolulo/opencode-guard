@@ -884,6 +884,25 @@ const modeFor = async (sessionID) => {
     } catch { /* cache is best-effort: a write failure just means a re-classify */ }
   };
 
+  // Auto's own answer for a descendant ask, with nobody asked: every non-bash permission
+  // auto approves (shouldAutoApprove), and bash only on a SAFE verdict -- the static read
+  // list, else the classifier -- never a credential command. No verdict (level static or off
+  // for an unlisted command, a privacy profile with no local lane, a classifier error) is not
+  // SAFE. Any failure answers false: the caller then escalates exactly as before.
+  const judgedSafeAsAuto = async (permission, command, sessionID) => {
+    try {
+      if (permission !== "bash") return shouldAutoApprove({ mode: "auto", permission, verdict: null });
+      if (!command || touchesCredentials(command)) return false;
+      if (commandIsRead(command)) return true;
+      if (level() !== "on") return false;
+      const route = await routeFor(sessionID);
+      if (!route?.lanes?.length) return false;
+      return await classifyCached(command, sessionID, route) === "SAFE";
+    } catch {
+      return false;
+    }
+  };
+
   const classifyCached = async (command, sessionID, route) => {
     if (verdicts.has(command)) return verdicts.get(command);
     const key = cacheKey(command);
@@ -1196,7 +1215,19 @@ const modeFor = async (sessionID) => {
           failClosed("deny(root-policy-changed)", `${what}: the root's rules changed after the floors were skipped; denied, retry the call`);
           return;
         }
-        const proposal = decideProposal({ ...ctx, permission, status: output.status, escalation, rootDeny: currentRootDeny });
+        let proposal = decideProposal({ ...ctx, permission, status: output.status, escalation, rootDeny: currentRootDeny });
+        // A god descendant's plain native ASK (no floor stash, no root deny) that an AUTO root's
+        // descendant would get without anyone asked is allowed here instead of costing the god
+        // root a model turn. 2026-10-20 measurement: 2,674 descendant asks in 3 days, 673 root
+        // turns and 5.3 h spent on guard_decide, children blocked on it 44% of active wall time.
+        // God is strictly wider than auto, so this grants nothing auto would not: every native
+        // DENY, every floor or root-deny escalation, and whatever auto's own judgment would
+        // refuse or cannot decide still goes to the root model exactly as before.
+        if (proposal?.approval?.kind === "parent" && ctx.rootMode === "god" && !ctx.isRoot &&
+            output.status === "ask" && !escalation && !marker && !currentRootDeny &&
+            await judgedSafeAsAuto(permission, command, sessionID)) {
+          proposal = { status: "allow", judgedAsAuto: true };
+        }
         // A stash always maps to a proposal in the table; reaching here is a guard bug.
         if (!proposal && escalation) throw new Error(`stashed ${escalation.kind} escalation produced no proposal`);
         if (!proposal && !original) return;
@@ -1256,7 +1287,8 @@ const modeFor = async (sessionID) => {
         if (proposal.forceAsk) output.forceAsk = true;
         if (proposal.always) output.always = proposal.always;
         if (mark) markJudged(key, mark);
-        log(proposal.override ? "allow(god/override)" : proposal.approval ? `escalate(${proposal.approval.kind})` : "allow(god)", what);
+        log(proposal.override ? "allow(god/override)" : proposal.approval ? `escalate(${proposal.approval.kind})`
+          : proposal.judgedAsAuto ? `allow(god-child/as-auto/${permission})` : "allow(god)", what);
       } catch (error) {
         // No restriction and no bound call: native keeps its own verdict.
         if (!original) throw error;

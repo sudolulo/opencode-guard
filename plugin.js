@@ -88,6 +88,7 @@ import { AGENT_SHELL_ENV, AGENT_SPAWN_REFUSAL, agentSpawnRefusal } from "./lib/a
 import { AUTHORITY_UNSUPPORTED, createAuthorityBroker, sessionOf } from "./lib/authority.js";
 import { createRootLifecycle } from "./lib/lifecycle.js";
 import { decideProposal } from "./lib/escalation.js";
+import { pendingView } from "./lib/pending-view.js";
 
 // Server plugins receive the legacy SDK client. The matching V2 client below
 // keeps its embedded-app fetch transport while generating V2 request bodies.
@@ -1073,7 +1074,7 @@ const modeFor = async (sessionID) => {
         description: "List native pending parent approvals owned by this god-mode root.",
         args: {},
         async execute(_args, ctx) {
-          return JSON.stringify(await authority.pending({ sessionID: ctx.sessionID }));
+          return JSON.stringify((await authority.pending({ sessionID: ctx.sessionID })).map(pendingView));
         },
       }),
       guard_decide: tool({

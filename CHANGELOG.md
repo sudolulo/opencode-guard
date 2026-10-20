@@ -7,6 +7,12 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.10.1] — 2026-10-20
+
+### Changed
+
+- **`guard_pending` returns a compact view of each request.** Everything the approver needs to see the exact action is kept verbatim -- id, child, permission, patterns, approval reason and every metadata field (command, workdir, file paths, full diff). Dropped: `files[].patch`, which repeats the diff (kept when there is no diff), and the internal `tool` ids and approval kind/session that `guard_decide` does not use. On the last 391 real outputs: 1.25M -> 0.90M characters (28% smaller), all of which the root re-reads every request. `lib/pending-view.js`.
+
 ## [1.10.0] — 2026-10-20
 
 ### Changed

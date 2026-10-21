@@ -6,6 +6,14 @@ Not yet implemented. Implementation plan:
 [concurrent approver plan](file:///home/dev/opencode-guard/docs/superpowers/plans/2026-10-21-concurrent-approver.md).
 The §9 decisions are resolved inline there. Prompted by the 2026-10-21 depot approval-peg incident.
 
+**Progress / blocker (2026-10-21):** Task 1 (the approver registry, `lib/approver.js`) is implemented,
+inert, and tested (9/9). Tasks 2–4 are **deferred on a capability blocker**: the guard has no verified
+plugin-callable API to CREATE a seat-restricted approver subagent (`session.background` only promotes
+an existing root). See the plan's "BLOCKER" section — Option A (confirm/add a create-subagent
+capability; may become a host change ≈ M2) or Option B (root spawns the approver via its own `task`
+tool and the guard recognizes + seat-restricts it). The peg is already relieved live by the shipped
+batching guidance (`1bbbed6`), so this is not urgent.
+
 **Resolved decisions (§9):** (1) M1 — a guard-managed, incarnation-bound, approval-only subagent
 delegate carries the root's approval authority; (2) the approver runs on a cheaper/faster lane
 (a `-nothink` tier), measured against parity; (3) start with a SINGLE approver (pool is a later

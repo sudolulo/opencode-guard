@@ -110,7 +110,31 @@ anchors show), `plugin.js` tool exposure, `tests/tree-rules.test.mjs` (extend) o
 - [ ] Tests (Review focus 5): the approver seat is denied each acting tool; is allowed exactly the
       two guard tools; a non-approver session is unaffected.
 
-### Task 4: Spawn, lifecycle, and wake routing (inert behind the flag)
+### ⚠ BLOCKER found 2026-10-21 (Task 4 spawn) — settle before Tasks 2–4
+
+Investigation of the guard's SDK surface found **no verified, plugin-callable API to CREATE a
+seat-restricted approval-only subagent**. The guard can `v2.permission.list/reply`, `v2.v2.session.get`,
+`v2.experimental.session.background` (**promotes an EXISTING root**, does not create a restricted new
+session — authority.js:503), `sdk.session.promptAsync` (**prompts an existing session**), and list
+`children`. None of these creates the dedicated approver M1 assumed ("spawned via the allowed task
+path" was unverified when written). Two real paths remain; **this is a decision point, not something
+to fabricate into the floor:**
+
+- **Option A — guard-spawned approver.** Needs a confirmed plugin-callable create-subagent API (with
+  a custom restricted seat). If it does not exist, it is a host/fork capability add — i.e. M1 drifts
+  toward M2's host-change cost. Verify the API before building.
+- **Option B — root-spawned, guard-recognized approver.** The root spawns the approver with its own
+  `task` tool (allowed; the model acts, not the guard — C2 holds), the approver registers itself via
+  a new guard tool, and the guard enforces its approval-only seat and grants it the delegate
+  authority. Uses only verified primitives (`promptAsync` to drive it), but is a larger protocol than
+  the spec assumed (root cooperation, a self-register tool, seat enforcement on a model-spawned child).
+
+Until this is settled, **Task 2 (authority delegate) is deferred**: refactoring `decide`/`pending`
+for an approver that cannot yet be spawned is risk (hot floor file, parallel-session collision) with
+no live benefit. Task 1 (registry) stands as the safe foundation. The peg itself is already relieved
+live by the shipped batching guidance (`1bbbed6`), so there is no pressure to rush this.
+
+### Task 4: Spawn, lifecycle, and wake routing (inert behind the flag) — pending the blocker above
 
 **Files:** `lib/notify.js`, `lib/lifecycle.js` (teardown hook), a spawn helper (likely
 `lib/approver.js` + `lib/agent-spawn.js` awareness), `tests/loop-guard.test.mjs` /

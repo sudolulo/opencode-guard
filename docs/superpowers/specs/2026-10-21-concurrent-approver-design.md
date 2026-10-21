@@ -1,8 +1,16 @@
 # Concurrent approval for a busy god root (dedicated approver)
 
-**Status:** PROPOSED — for Holden's review. Nothing decided, nothing implemented. This records a
-design and the decisions it needs; it does not bind policy. Prompted by the 2026-10-21 depot
-approval-peg incident.
+**Status:** Structure DECIDED (Holden delegated it to the implementer: "you decide the best
+structure. approve", 2026-10-21) — **M1, single approver, feature-flagged off by default, phased**.
+Not yet implemented. Implementation plan:
+[concurrent approver plan](file:///home/dev/opencode-guard/docs/superpowers/plans/2026-10-21-concurrent-approver.md).
+The §9 decisions are resolved inline there. Prompted by the 2026-10-21 depot approval-peg incident.
+
+**Resolved decisions (§9):** (1) M1 — a guard-managed, incarnation-bound, approval-only subagent
+delegate carries the root's approval authority; (2) the approver runs on a cheaper/faster lane
+(a `-nothink` tier), measured against parity; (3) start with a SINGLE approver (pool is a later
+throughput knob); (4) while an approver is registered it owns the queue, and the root-wake path is
+the fallback when none is registered (C4); (5) M1 over M2 (M2 needs fork work the guard cannot do).
 
 **Relates to:** [god escalation policy](file:///home/dev/opencode-guard/docs/superpowers/specs/2026-10-14-god-escalation-policy-design.md)
 (this amends *how* escalated approvals are serviced, not *what* escalates or auto-approves — that

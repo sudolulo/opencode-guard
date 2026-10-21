@@ -7,6 +7,10 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+### Changed
+
+- **A god root clears its whole approval queue in one turn instead of one ask per turn.** The pending wake and the `guard_pending` / `guard_decide` tool descriptions now tell the root to list every pending request and decide them all in the same turn, rather than the old singular "inspect and decide it". Under a heavy subagent fan-out the root was pegged spending a model turn per escalated ask while children waited (2026-10-21, depot: 17 asks in ~24 min, a child blocked ~14 min at the peak). Guidance-only: each decision is still the exact per-request `guard_decide` with unchanged ownership/incarnation checks; nothing about what may be approved changes. Wake text in `lib/notify.js`; tool descriptions in `plugin.js`.
+
 ## [1.10.3] — 2026-10-20
 
 ### Fixed

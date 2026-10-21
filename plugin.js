@@ -1071,14 +1071,14 @@ const modeFor = async (sessionID) => {
   return {
     tool: {
       guard_pending: tool({
-        description: "List native pending parent approvals owned by this god-mode root.",
+        description: "List ALL native pending parent approvals owned by this god-mode root. When any are pending, decide them all in the SAME turn (one guard_decide per request) so no child is left waiting a model turn each.",
         args: {},
         async execute(_args, ctx) {
           return JSON.stringify((await authority.pending({ sessionID: ctx.sessionID })).map(pendingView));
         },
       }),
       guard_decide: tool({
-        description: "Approve once or reject one native parent approval owned by this god-mode root.",
+        description: "Approve once or reject one native parent approval owned by this god-mode root. Call it once per pending request in the SAME turn to clear the whole guard_pending queue at once, so a busy root is not pegged deciding one ask per turn.",
         args: {
           permissionID: tool.schema.string(),
           decision: tool.schema.enum(["once", "reject"]),

@@ -237,7 +237,7 @@ test("approval notification preserves root identity and wakes a busy root at onc
   assert.deepEqual(sent, [{
     sessionID: "ses_root", directory: "/work", agent: "smart",
     model: { providerID: "openai", modelID: "gpt", variant: "fast" },
-    parts: [{ type: "text", text: "A child permission request (per_1) is pending. Use guard_pending and guard_decide to inspect and decide it.", synthetic: true }],
+    parts: [{ type: "text", text: "A child permission request (per_1) is pending, and more may be queued. Call guard_pending to list EVERY pending request for this root and decide them ALL in this one turn (one guard_decide per request), before resuming your own work -- each child stays blocked until you decide it.", synthetic: true }],
   }]);
 });
 

@@ -1525,6 +1525,19 @@ const modeFor = async (sessionID) => {
               return;
             }
           }
+          // An auto DESCENDANT's classifier remainder (RISKY, or no verdict because the lane is
+          // unavailable) defers UP to the owning root's person instead of being denied here. By
+          // now the floor ran in auto class, so SAFE and reads already proceeded -- only what the
+          // classifier could not bless is left, so the main session is asked about the remainder,
+          // never as a first-line classifier. The host surfaces a native "operator" ask to the
+          // attended root's person at any depth. An auto ROOT (ctx.isRoot), an unattended process
+          // with no one to ask, and the credential/destructive/launder floors all keep denying by
+          // falling through to the throw.
+          if (!isUnattended && !ctx.isRoot && ctx.rootMode === "auto" && key && binding &&
+              (refusal.class === "llm" || refusal.class === "no-classifier" || refusal.class === "classifier-unavailable")) {
+            defer("operator", refusal.class);
+            return;
+          }
           throw new Error(refusal.message);
         }
         // Non-deferrable tools fall through to the legacy throwing sequence.

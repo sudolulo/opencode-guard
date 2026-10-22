@@ -627,21 +627,51 @@ const AUTO_FLOORS = [
   ["launder", "sed -i s/a/b/ notes.txt", /matches an allow rule for a read-only command/, {}],
   ["hard credential", "cat mcp-auth.json", /names a credential store/, {}],
   ["cc-safety-net", "git reset --hard HEAD~1", /git reset --hard destroys/, {}],
-  ["classifier RISKY", "curl -X POST https://example.invalid", /looks risky to run unattended/, { classifier: "RISKY" }],
-  ["no classifier lane", "curl -X POST https://example.invalid", /could not be judged/, { profile: "local" }],
+  // The classifier's own remainder: the auto root still denies its own, but a descendant defers
+  // it UP to the person (see the dedicated tests below) instead of the old silent deny.
+  ["classifier RISKY", "curl -X POST https://example.invalid", /looks risky to run unattended/, { classifier: "RISKY" }, true],
+  ["no classifier lane", "curl -X POST https://example.invalid", /could not be judged/, { profile: "local" }, true],
 ];
 
-for (const [label, command, message, options] of AUTO_FLOORS) {
-  test(`A16 auto root and auto descendant: ${label} throws the root's own message`, () => {
-    const { results, log } = escalationPlugin([
-      bashBefore("ses_root", "c1", command),
-      bashBefore("ses_child", "c2", command),
-    ], { rootMode: "auto", ...options });
+for (const [label, command, message, options, childDefers] of AUTO_FLOORS) {
+  test(`A16 auto root denies ${label}; the descendant ${childDefers ? "defers it up to the person" : "is denied the same"}`, () => {
+    const steps = [bashBefore("ses_root", "c1", command), bashBefore("ses_child", "c2", command)];
+    if (childDefers) steps.push(bashAsk("ses_child", "c2", command, "ask"));
+    const { results, log } = escalationPlugin(steps, { rootMode: "auto", ...options });
     assert.match(results[0].threw ?? "", message, `root: ${label}`);
-    assert.match(results[1].threw ?? "", message, `child: ${label}`);
-    assert.doesNotMatch(log, /stash\(/);
+    if (childDefers) {
+      assert.equal(results[1].threw, null, `child floor does not deny: ${label}`);
+      assert.equal(results[2].approval.kind, "operator", `child defers up as operator: ${label}`);
+      assert.match(log, /stash\(operator\//, `child stashes an operator escalation: ${label}`);
+    } else {
+      assert.match(results[1].threw ?? "", message, `child: ${label}`);
+      assert.doesNotMatch(log, /stash\(/, label);
+    }
   });
 }
+
+test("auto descendant: a classifier-RISKY remainder is an UNMARKED operator ask the person answers -- not self-settled, never a model", () => {
+  const { results, replies, calls, log } = escalationPlugin([
+    bashBefore("ses_child", "c1", "curl -X POST https://example.invalid"),
+    bashAsk("ses_child", "c1", "curl -X POST https://example.invalid", "ask"),
+  ], { rootMode: "auto", classifier: "RISKY" });
+  assert.equal(results[0].threw, null, "not denied at the floor");
+  assert.equal(results[1].approval.kind, "operator");
+  assert.equal(results[1].approval.sessionID, "ses_root", "surfaces at the owning root");
+  assert.equal(results[1].judged, undefined, "unmarked: the guard never self-settles it");
+  assert.deepEqual(replies, [], "the person answers the native operator ask; the guard sends no reply");
+  assert.deepEqual(promotions(calls), [], "never promotes");
+  assert.deepEqual(wakes(calls), [], "never wakes a model");
+  assert.match(log, /stash\(operator\/llm\)/);
+});
+
+test("unattended descendant: a classifier-RISKY command is still denied -- there is no one to defer to", () => {
+  const { results, log } = escalationPlugin([
+    bashBefore("ses_child", "c1", "curl -X POST https://example.invalid"),
+  ], { rootMode: "auto", classifier: "RISKY", unattended: true });
+  assert.ok(results[0].threw, "denied, not deferred");
+  assert.doesNotMatch(log, /stash\(operator/, "no defer-up when unattended");
+});
 
 test("A16 auto descendant: launder is judged against the ROOT's rules as well as the child's", () => {
   const { results } = escalationPlugin([bashBefore("ses_child", "c1", "sed -i s/a/b/ notes.txt")], { rootMode: "auto", childAgent: "tight" });

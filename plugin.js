@@ -57,7 +57,6 @@
 // own tool.execute.before hook -- hooks from different plugins all run, so a throw
 // from either blocks the tool.
 import { readFileSync, appendFileSync, statSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -79,6 +78,7 @@ import {
 } from "./lib/policy.js";
 import { brokerAvailable, brokerRequest, resolveProfileFor } from "./lib/broker.js";
 import { classifierConfig, classifierRoute, classifyDirect, verdictFromText } from "./lib/classifier.js";
+import { createClassifierCache } from "./lib/classifier-cache.js";
 import { createLoopGuard, createLoopGuardHook, loopGuardOptions } from "./lib/loop-guard.js";
 import { createApprovalNotifier, createNotifier } from "./lib/notify.js";
 import { readSessionIdentity } from "./lib/session-identity.js";
@@ -257,6 +257,16 @@ export const OpencodeGuard = async ({ client, directory }) => {
   // permission.asked id -> the `always` patterns an "Always" reply would save.
   const alwaysPatterns = new Map();
   const sessionAgents = new Map();
+  // A routed classifier's prompt must use the same no-think provider list as the
+  // route/cache snapshot that created it. classifier.json can change between the
+  // child create and OpenCode's chat.params hook, so retain an immutable per-child
+  // copy and its native incarnation only for guard-owned disposable classifier sessions.
+  const classifierNoThinkProviders = new Map();
+  const CLASSIFIER_SNAPSHOT_CAP = 300;
+  // This cap bounds guard-tracked snapshots plus pending creates, not all unknown
+  // remote create side effects. Reserve before awaiting so a burst cannot all see
+  // a non-full snapshot map.
+  const classifierSnapshotReservations = new Set();
   const SESSION_AGENTS_CAP = 2000;
   let agentRules = null;
   let agentRulesAt = 0;
@@ -402,9 +412,6 @@ export const OpencodeGuard = async ({ client, directory }) => {
     judged.delete(key);
     return entry;
   };
-  // command -> verdict, so the same command judged in tool.execute.before is not
-  // re-judged when its permission prompt arrives moments later.
-  const verdicts = new Map();
   let v2;
 
   const v2Client = () => {
@@ -455,8 +462,7 @@ const infoFor = async (sessionID) => {
     return null;
   }
 };
-const profileFor = async (sessionID) => {
-  const dir = classifierConfig().brokerDir;
+const profileFor = async (sessionID, dir) => {
   const resolved = resolveProfileFor({ sessionID, dir });
   if (resolved.source !== "default" || !sessionID) return resolved;
   const info = await infoFor(sessionID);
@@ -466,11 +472,12 @@ const profileFor = async (sessionID) => {
 // Where a command for this session may be judged, and whether at all. See
 // classifierRoute in lib/classifier.js: a privacy profile only ever reaches a
 // local lane, and no lane at all is a refusal rather than a cloud call.
-const routeFor = async (sessionID) => {
-  const profile = (await profileFor(sessionID)).profile;
+  const routeFor = async (sessionID) => {
   const config = classifierConfig();
+  const profile = (await profileFor(sessionID, config.brokerDir)).profile;
   return {
     profile,
+    config,
     ...classifierRoute({
       profile,
       config,
@@ -653,12 +660,19 @@ const modeFor = async (sessionID) => {
     let sessionID = null;
     let incarnationID = null;
     let useIncarnation = false;
+    let snapshotReservation = null;
+    let snapshotEntry = null;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CLASSIFIER_TIMEOUT_MS);
     try {
       if (typeof parentSessionID !== "string" || !parentSessionID.startsWith("ses")) {
         throw new Error("classifier requires an OpenCode parent session");
       }
+      if (classifierNoThinkProviders.size + classifierSnapshotReservations.size >= CLASSIFIER_SNAPSHOT_CAP) {
+        throw new Error(`classifier session capacity exhausted (${CLASSIFIER_SNAPSHOT_CAP} active snapshots)`);
+      }
+      snapshotReservation = Symbol("classifier snapshot reservation");
+      classifierSnapshotReservations.add(snapshotReservation);
       useIncarnation = await classifierIncarnations();
 
       // A classifier must be a child of the requesting session. Root sessions made
@@ -681,6 +695,13 @@ const modeFor = async (sessionID) => {
       if (useIncarnation && (typeof incarnationID !== "string" || incarnationID === "")) {
         throw new Error("OpenCode did not return a classifier session incarnation ID");
       }
+      snapshotEntry = {
+        providers: Object.freeze([...(config?.noThinkProviders ?? [])]),
+        incarnationID,
+      };
+      classifierNoThinkProviders.set(sessionID, snapshotEntry);
+      classifierSnapshotReservations.delete(snapshotReservation);
+      snapshotReservation = null;
       // The legacy prompt endpoint runs through the same authenticated provider
       // resolution as an ordinary Task child and returns the completed assistant
       // message. The V2 prompt endpoint cannot carry the resolved OAuth context.
@@ -752,6 +773,7 @@ const modeFor = async (sessionID) => {
       return `error:${detail}`;
     } finally {
       clearTimeout(timer);
+      if (snapshotReservation) classifierSnapshotReservations.delete(snapshotReservation);
       if (sessionID) {
         const cleanupQuery = useIncarnation ? { directory, incarnationID } : { directory };
         const checkedCleanup = async (operation) => {
@@ -785,6 +807,11 @@ const modeFor = async (sessionID) => {
           }
           if (!idle) throw new Error(`still busy after ${CLEANUP_IDLE_MS}ms`);
           await checkedCleanup(() => client.session.delete({ path: { id: sessionID }, query: cleanupQuery }));
+          // Keep the immutable policy through every late chat.params until the
+          // disposable session is demonstrably gone.
+          if (classifierNoThinkProviders.get(sessionID) === snapshotEntry) {
+            classifierNoThinkProviders.delete(sessionID);
+          }
         } catch (error) {
           // A leaked disposable session is safer than deleting beneath a loop that has
           // not proved it is idle; a later operator cleanup can remove the row safely.
@@ -800,8 +827,7 @@ const modeFor = async (sessionID) => {
   // the common path cannot leak one; classifyRouted does, and is reached only when
   // it is the only lane or the direct one failed fast. The timeout exclusion is
   // directFallbackWarranted in lib/policy.js, where it is tested.
-  const classify = async (command, cwd, sessionID, route) => {
-    const config = classifierConfig();
+  const classify = async (command, cwd, sessionID, route, config) => {
     const broker = route.lanes.includes("broker");
     if (route.lanes.includes("direct")) {
       const verdict = await classifyDirect({ command, cwd, config });
@@ -812,8 +838,8 @@ const modeFor = async (sessionID) => {
     return "error:no-classifier";
   };
 
-  const classifyWithRetry = async (command, sessionID, route) => {
-    let verdict = await classify(command, directory, sessionID, route);
+  const classifyWithRetry = async (command, sessionID, route, config) => {
+    let verdict = await classify(command, directory, sessionID, route, config);
     if (!route.lanes.includes("direct")) {
       // ☠️ A broker ladder can put a cloud fallback below a local primary, but a
       // single attempt could never reach it: the rung is chosen at /lease time, so
@@ -827,13 +853,13 @@ const modeFor = async (sessionID) => {
       if (verdict === "SAFE" || verdict === "RISKY") return verdict;
       if (verdict === "error:timeout") return verdict;
       log(`re-leasing after ${verdict}`, command);
-      return classify(command, directory, sessionID, route);
+      return classify(command, directory, sessionID, route, config);
     }
     for (const waitMs of [750, 2500]) {
       if (verdict === "SAFE" || verdict === "RISKY") break;
       log(`retrying in ${waitMs}ms after ${verdict}`, command);
       await new Promise((r) => setTimeout(r, waitMs));
-      verdict = await classify(command, directory, sessionID, route);
+      verdict = await classify(command, directory, sessionID, route, config);
     }
     return verdict;
   };
@@ -841,12 +867,12 @@ const modeFor = async (sessionID) => {
   // Majority vote when configured (votes>1), else a single call. FAIL-CLOSED: SAFE
   // only with a strict majority of the configured votes; a tie, a lone dissent, or
   // errors all resolve toward RISKY. votes=1 (the default) is exactly the old path.
-  const classifyVoted = async (command, sessionID, route) => {
-    const { votes } = classifierConfig();
-    if (votes <= 1) return classifyWithRetry(command, sessionID, route);
+  const classifyVoted = async (command, sessionID, route, config) => {
+    const { votes } = config;
+    if (votes <= 1) return classifyWithRetry(command, sessionID, route, config);
     let safe = 0, risky = 0, errored = 0;
     for (let i = 0; i < votes; i++) {
-      const v = await classifyWithRetry(command, sessionID, route);
+      const v = await classifyWithRetry(command, sessionID, route, config);
       if (v === "SAFE") safe++;
       else if (v === "RISKY") risky++;
       else errored++;
@@ -865,25 +891,18 @@ const modeFor = async (sessionID) => {
   // layer; the file is the cross-session layer (last-write-wins is fine), and it
   // holds a hash of each command, never the command itself.
   const SHARED_CACHE = join(homedir(), ".local/share/opencode/classifier-verdicts.json");
-  const SHARED_TTL_MS = 6 * 60 * 60 * 1000;
-  const cacheKey = (command) => createHash("sha256").update(`${directory}\0${command}`).digest("hex").slice(0, 24);
   const readShared = () => {
     try { return JSON.parse(readFileSync(SHARED_CACHE, "utf8")); } catch { return {}; }
   };
-  const writeShared = (key, verdict) => {
+  const writeShared = (store) => {
     try {
-      const now = Date.now();
-      const store = readShared();
-      for (const [k, v] of Object.entries(store)) if (now - (v?.[1] ?? 0) > SHARED_TTL_MS) delete store[k];
-      store[key] = [verdict, now];
-      const keys = Object.keys(store);
-      if (keys.length > 2000) for (const k of keys.slice(0, keys.length - 2000)) delete store[k];
       mkdirSync(join(homedir(), ".local/share/opencode"), { recursive: true });
       const tmp = `${SHARED_CACHE}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(store), { mode: 0o600 });
       renameSync(tmp, SHARED_CACHE);
     } catch { /* cache is best-effort: a write failure just means a re-classify */ }
   };
+  const classifierCache = createClassifierCache({ readShared, writeShared });
 
   // Auto's own answer for a descendant ask, with nobody asked: every non-bash permission
   // auto approves (shouldAutoApprove), and bash only on a SAFE verdict -- the static read
@@ -905,21 +924,14 @@ const modeFor = async (sessionID) => {
   };
 
   const classifyCached = async (command, sessionID, route) => {
-    if (verdicts.has(command)) return verdicts.get(command);
-    const key = cacheKey(command);
-    const shared = readShared()[key];
-    if (shared && Date.now() - (shared[1] ?? 0) < SHARED_TTL_MS && (shared[0] === "SAFE" || shared[0] === "RISKY")) {
-      verdicts.set(command, shared[0]);         // promote into the hot layer
-      return shared[0];
-    }
-    const verdict = await classifyVoted(command, sessionID, route);
-    // Only cache decided verdicts: an error or timeout must be retried, not
-    // remembered, or one blip would pin a command to "prompt" for the session.
-    if (verdict === "SAFE" || verdict === "RISKY") {
-      if (verdicts.size > 300) verdicts.clear();
-      verdicts.set(command, verdict);
-      writeShared(key, verdict);                // share with every other session
-    }
+    // The route config is one snapshot from before cache lookup through all votes
+    // and retries, so the fingerprint describes exactly the judgment that ran.
+    const config = route.config;
+    const request = { command, cwd: directory, config, route };
+    const cached = classifierCache.get(request);
+    if (cached) return cached;
+    const verdict = await classifyVoted(command, sessionID, route, config);
+    classifierCache.put({ ...request, verdict });
     return verdict;
   };
 
@@ -1114,7 +1126,7 @@ const modeFor = async (sessionID) => {
         sessionAgents.set(input.sessionID, input.agent);
         if (sessionAgents.size > SESSION_AGENTS_CAP) sessionAgents.delete(sessionAgents.keys().next().value);
       }
-      const { noThinkProviders } = classifierConfig();
+      const noThinkProviders = classifierNoThinkProviders.get(input?.sessionID)?.providers ?? classifierConfig().noThinkProviders;
       if (!localNoThinkApplies(input?.agent, input?.provider?.id, noThinkProviders)) return;
       output.options = {
         ...output.options,
@@ -1654,9 +1666,17 @@ const modeFor = async (sessionID) => {
       // deleted session's parent or teammate classification to its same-ID
       // replacement. loop-guard holds repeat counters, not host facts: a late
       // eviction only restarts the replacement's count, the same as a fresh session.
-      if (event?.type === "session.deleted") {
-        const gone = event.properties?.info?.id ?? event.properties?.sessionID;
-        if (gone) {
+        if (event?.type === "session.deleted") {
+          const properties = event.properties;
+          const deletedInfo = properties?.info;
+          const gone = deletedInfo?.id ?? properties?.sessionID;
+          if (gone) {
+          const snapshot = classifierNoThinkProviders.get(gone);
+          const deletedIncarnationID = deletedInfo?.incarnationID;
+          if (typeof deletedIncarnationID === "string" && deletedIncarnationID !== "" &&
+              snapshot?.incarnationID === deletedIncarnationID) {
+            classifierNoThinkProviders.delete(gone);
+          }
           for (const [cache, forget] of [
             ["session-info", () => sessionInfo.delete(gone)],
             ["session-tree", () => sessionTree.forget(gone)],

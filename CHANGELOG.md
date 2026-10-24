@@ -7,6 +7,12 @@ were released privately as opencode-guardrails.
 
 ## [Unreleased]
 
+## [1.10.4] — 2026-10-23
+
+### Fixed
+
+- Classifier verdict caching now expires after 6 hours and uses bounded hashed keys sensitive to policy, profile, route and credentials. Classifier configuration remains immutable through its lifecycle, and cleanup is incarnation-safe; session deletion is read once. Regression coverage confirms unattended MCP preserves native verdicts; MCP policy is unchanged.
+
 ### Changed
 
 - **An auto-mode descendant's risky command defers up to its root's person instead of a silent deny.** A subagent under an auto (non-god) root used to have its classifier-RISKY — and no-lane / classifier-unavailable — bash DENIED at the floor: the person never saw the request, and the agent could only cope or escalate in prose. It now defers that one command up as an UNMARKED native `operator` ask, which the host surfaces to the owning root's person at any depth (parent-permission-authority). The classifier still does the SAFE/read triage first, so the person is asked only about the remainder it could not bless — never as a first-line classifier. An auto ROOT still denies its own; an unattended process (no one to ask) still denies, so nothing is left hanging; and the credential / destructive (cc-safety-net) / launder floors still hard-deny. god is unchanged — its remainder still goes to the root model via `guard_decide`. `plugin.js` (auto-descendant defer in `tool.execute.before`, bash-only via refusal class `llm`/`no-classifier`/`classifier-unavailable`), `lib/escalation.js` (non-god `operator` escalation mapping, left unmarked so the person — not the guard's classifier, not a model — decides). Tests in `tests/escalation-plugin.test.mjs`.

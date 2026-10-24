@@ -196,10 +196,10 @@ const escalationPlugin = (steps, {
             results.push(output.ask === undefined ? { threw: null } : { threw: null, ask: output.ask });
           } catch (error) { results.push({ threw: String(error?.message ?? error) }); }
         } else if (step.ask) {
-          const { session, callID, permission, status, command, patterns, wrap, preset } = step.ask;
+          const { session, callID, permission, status, command, patterns, metadata, wrap, preset } = step.ask;
           const request = {
             sessionID: session, permission, patterns: patterns ?? (command ? [command] : []), always: [],
-            metadata: command ? { command } : {},
+            metadata: metadata ?? (command ? { command } : {}),
             ...(callID === undefined ? {} : { tool: { messageID: "m", callID } }),
           };
           const output = { status, ...(preset ?? {}) };
@@ -1425,6 +1425,29 @@ test("A23 unattended: no proposals, no override and the legacy floors throw", ()
   assert.deepEqual(results[1], { status: "deny" });
   assert.deepEqual(results[2], { status: "deny" });
   assert.match(results[3].threw, /matches a deny rule in the opencode permission config/);
+});
+
+test("A23 unattended: native MCP asks retain their verdicts without an escalation or reply", () => {
+  for (const rootMode of ["god", "auto"]) {
+    // `metadata` is passed through exactly as supplied by the fake host. `command` is the
+    // existing host-supported metadata member; this does not claim an MCP transport schema.
+    const { results, replies, calls } = escalationPlugin([
+      { ask: { session: "ses_child", callID: "mcp-deny", permission: "mcp", status: "deny", patterns: ["filesystem"], metadata: { command: "mcp__filesystem__read_file" } } },
+      { asked: { id: "per_mcp_deny", session: "ses_child", callID: "mcp-deny", permission: "mcp", fromAsk: 0, patterns: ["filesystem"] } },
+      { ask: { session: "ses_child", callID: "mcp-ask", permission: "mcp", status: "ask", patterns: ["filesystem"], metadata: { command: "mcp__filesystem__read_file" } } },
+      { asked: { id: "per_mcp_ask", session: "ses_child", callID: "mcp-ask", permission: "mcp", fromAsk: 2, patterns: ["filesystem"] } },
+      { ask: { session: "ses_child", callID: "bash-mcp", permission: "bash", status: "ask", patterns: ["mcp__filesystem__read_file"], metadata: { command: "mcp__filesystem__read_file" } } },
+      { asked: { id: "per_bash_mcp", session: "ses_child", callID: "bash-mcp", permission: "bash", fromAsk: 4, patterns: ["mcp__filesystem__read_file"] } },
+    ], { unattended: true, rootMode });
+    assert.deepEqual(results, [
+      { status: "deny" }, { approval: null },
+      { status: "ask" }, { approval: null },
+      { status: "ask" }, { approval: null },
+    ], rootMode);
+    assert.deepEqual(replies, [], `${rootMode}: the exercised permission.asked hooks send no native reply`);
+    assert.deepEqual(promotions(calls), [], `${rootMode}: no parent approval is promoted`);
+    assert.deepEqual(wakes(calls), [], `${rootMode}: no parent approval wakes a root`);
+  }
 });
 
 test("A23 level off: no proposals and native verdicts untouched", () => {
